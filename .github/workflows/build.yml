@@ -1,0 +1,32 @@
+name: Build Latency Checker
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --collect-data sv_ttk --name "Latency Checker" latency_viewer.py
+          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+          cd dist && ditto -c -k --keepParent "Latency Checker.app" LatencyChecker-macOS.zip
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --noconfirm --windowed --onefile --collect-data sv_ttk --name LatencyChecker latency_viewer.py
+          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LatencyChecker-${{ runner.os }}
+          path: |
+            dist/LatencyChecker-macOS.zip
+            dist/LatencyLogger
+            dist/LatencyChecker.exe
+            dist/LatencyLogger.exe
