@@ -1,6 +1,6 @@
 # Latency Checker
 
-Latency monitoring for macOS and Windows, split into two programs:
+Latency monitoring for macOS, Windows and Linux, split into two programs:
 
 | | What it does | Needs |
 |---|---|---|
@@ -32,7 +32,15 @@ Or from an admin prompt: `py -3 latency_logger.py install`.
 
 **Check it:** `python3 latency_logger.py status` shows whether the service is installed, whether the logger is running, the last heartbeat, gateway and public IP.
 **Remove it:** `uninstall_service_mac.command` / `uninstall_service_windows.bat`, or `latency_logger.py uninstall`.
-**Linux:** `sudo python3 latency_logger.py install` sets up a systemd unit in the same way.
+**Linux (systemd):** run `./install_service_linux.sh`, which asks for sudo. Or run `sudo python3 latency_logger.py install`.
+
+- It installs a system service, `/etc/systemd/system/latency-logger.service`. It starts at every boot, before anyone logs in, and runs as *your* user so the logs belong to you. `Restart=always` brings it back if it stops.
+- The logger is copied to `~/LatencyChecker/app/`, so run the installer again after updating the code.
+- **Without root:** `./install_service_linux.sh --at-login` installs a per-user service in `~/.config/systemd/user/` that runs while you're logged in. To keep it running when you're logged out and start it at boot, also run `sudo loginctl enable-linger $USER` once.
+- **Day-to-day:** `python3 latency_logger.py status`, `sudo python3 latency_logger.py restart` (drop `sudo` for the user service), `journalctl -u latency-logger`, or `~/LatencyChecker/logger.log`.
+- **Remove it:** `./uninstall_service_linux.sh`.
+- **Requirements:** Python 3.9+ and `ping`; on Debian/Ubuntu, `sudo apt install iputils-ping` if it's missing. The logger needs no Python packages. It reads the gateway straight from `/proc/net/route`, so the `ip` tool isn't required either.
+- **Other init systems:** without systemd, start `python3 latency_logger.py run --quiet` from your init system or an `@reboot` cron entry.
 
 Only one logger runs at a time. If the service starts while you're running one by hand, it waits and takes over when that one stops.
 
@@ -42,6 +50,7 @@ Only one logger runs at a time. If the service starts while you're running one b
 2. Open it without any terminal window:
    - **macOS:** double-click **Latency Checker.app** in this folder. You can drag it to the Dock, but keep the app itself in this folder. The first time, right-click → Open, and allow access to the Documents folder if macOS asks.
    - **Windows:** double-click **Latency Checker (Windows).vbs**. You can make a shortcut to it on the desktop or in the Start menu.
+   - **Linux:** run `./run_linux.sh`, or `./install_desktop_linux.sh` once to add *Latency Checker* to your applications menu. Needs Tkinter: `sudo apt install python3-tk python3-venv` (Debian/Ubuntu), `sudo dnf install python3-tkinter` (Fedora) or `sudo pacman -S tk` (Arch).
    - `run_mac.command` and `run_windows.bat` still work too. The Terminal window now closes by itself once the viewer is open.
 
    On first run it creates a local `.venv` with matplotlib, the Sun Valley theme and dark-mode detection. That takes about a minute, and a notification tells you it's happening. Launch problems are written to `~/LatencyChecker/viewer-launch.log`.

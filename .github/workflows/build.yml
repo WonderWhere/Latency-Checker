@@ -4,7 +4,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,11 @@ jobs:
         run: |
           pyinstaller --noconfirm --windowed --onefile --collect-data sv_ttk --name LatencyChecker latency_viewer.py
           pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --onefile --collect-data sv_ttk --name latency-checker latency_viewer.py
+          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
       - uses: actions/upload-artifact@v4
         with:
           name: LatencyChecker-${{ runner.os }}
@@ -30,3 +35,4 @@ jobs:
             dist/LatencyLogger
             dist/LatencyChecker.exe
             dist/LatencyLogger.exe
+            dist/latency-checker

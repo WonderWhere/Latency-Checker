@@ -8,7 +8,7 @@ packages: standard-library Python 3.9+ only.
 
     python3 latency_logger.py                 run in the foreground (Ctrl+C to stop)
     python3 latency_logger.py status          is it installed / running?
-    sudo python3 latency_logger.py install    macOS/Linux: start automatically at boot
+    sudo python3 latency_logger.py install    macOS/Linux: start automatically at boot (launchd / systemd)
     python  latency_logger.py install         Windows (from an admin prompt): same
     python3 latency_logger.py install --at-login   start at login instead (no admin needed)
     python3 latency_logger.py uninstall       remove the automatic start
@@ -456,47 +456,107 @@ def uninstall_windows(args):
     return 0 if r.returncode == 0 else 1
 
 
+def _linux_unit_paths(home):
+    """(system unit, user unit)."""
+    return (Path("/etc/systemd/system") / LINUX_UNIT,
+            home / ".config" / "systemd" / "user" / LINUX_UNIT)
+
+
+def _systemctl_user(*a):
+    return _sh(["systemctl", "--user", *a])
+
+
 def install_linux(args, user, home, uid, gid, data):
-    if os.geteuid() != 0:
-        print(f"Run with sudo:  sudo {sys.executable} {Path(__file__).name} install")
+    if shutil.which("systemctl") is None:
+        print("systemd was not found. Run the logger from your init system or cron instead:\n"
+              f"  {_base_python()} {HERE / 'latency_logger.py'} run --quiet")
+        return 1
+    if args.at_login and os.geteuid() == 0:
+        print("A per-user service must be installed as you, not root. Run without sudo:\n"
+              f"  {sys.executable} {Path(__file__).name} install --at-login")
+        return 1
+    if not args.at_login and os.geteuid() != 0:
+        print("Starting at boot needs root. Run:\n"
+              f"  sudo {sys.executable} {Path(__file__).name} install\n"
+              "or use  install --at-login  for a per-user service (no root needed).")
         return 1
     prog = _deploy(data) + ["run", "--home", str(data), "--quiet"]
-    unit = f"""[Unit]
-Description=Latency Checker logger
-Wants=network-online.target
-After=network-online.target
+    exec_start = " ".join(f'"{p}"' for p in prog)
+    system_path, user_path = _linux_unit_paths(home)
+    if args.at_login:
+        unit = f"""[Unit]
+Description=Latency Checker logger (user)
+After=network.target
 
 [Service]
-User={user}
 Environment=LATENCYCHECKER_HOME={data}
-ExecStart={' '.join(f'"{p}"' for p in prog)}
+Environment=LC_ALL=C
+ExecStart={exec_start}
 Restart=always
 RestartSec=10
 
 [Install]
+WantedBy=default.target
+"""
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(unit)
+        _systemctl_user("daemon-reload")
+        r = _systemctl_user("enable", "--now", LINUX_UNIT)
+        if r.returncode != 0:
+            print("systemctl --user failed:\n" + r.stdout + r.stderr)
+            return 1
+        print(f"Installed {user_path}; running now and whenever you log in.\n"
+              "Tip: to keep it running while you're logged out (and start it at boot) run\n"
+              f"  sudo loginctl enable-linger {user}")
+        return 0
+    unit = f"""[Unit]
+Description=Latency Checker logger
+After=network.target
+
+[Service]
+User={user}
+Environment=LATENCYCHECKER_HOME={data}
+Environment=LC_ALL=C
+ExecStart={exec_start}
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
 WantedBy=multi-user.target
 """
-    path = Path("/etc/systemd/system") / LINUX_UNIT
-    path.write_text(unit)
+    system_path.write_text(unit)
     _chown_tree(data, uid, gid)
     _sh(["systemctl", "daemon-reload"], check=True)
     _sh(["systemctl", "enable", "--now", LINUX_UNIT], check=True)
-    print(f"Installed {path}; running now and at every boot.")
+    print(f"Installed {system_path}; the logger is running now and starts at every boot "
+          f"(as {user}), restarting if it ever stops.\n"
+          f"  data:        {data}\n  its own log: {data / 'logger.log'}\n"
+          f"  journal:     journalctl -u {LINUX_UNIT}")
     return 0
 
 
-def uninstall_linux(args):
-    path = Path("/etc/systemd/system") / LINUX_UNIT
-    if not path.exists():
+def uninstall_linux(args, home):
+    system_path, user_path = _linux_unit_paths(home)
+    removed = False
+    if user_path.exists():
+        _systemctl_user("disable", "--now", LINUX_UNIT)
+        user_path.unlink()
+        _systemctl_user("daemon-reload")
+        print(f"Removed {user_path}")
+        removed = True
+    if system_path.exists():
+        if os.geteuid() != 0:
+            print(f"Removing {system_path} needs root:\n  sudo {sys.executable} "
+                  f"{Path(__file__).name} uninstall")
+            return 1
+        _sh(["systemctl", "disable", "--now", LINUX_UNIT])
+        system_path.unlink()
+        _sh(["systemctl", "daemon-reload"])
+        print(f"Removed {system_path}")
+        removed = True
+    if not removed:
         print("No Latency Checker service was installed.")
-        return 0
-    if os.geteuid() != 0:
-        print(f"Run with sudo:  sudo {sys.executable} {Path(__file__).name} uninstall")
-        return 1
-    _sh(["systemctl", "disable", "--now", LINUX_UNIT])
-    path.unlink()
-    _sh(["systemctl", "daemon-reload"])
-    print(f"Removed {path}")
     return 0
 
 
@@ -520,7 +580,7 @@ def cmd_uninstall(args):
         return uninstall_macos(args, home)
     if core.SYSTEM == "Windows":
         return uninstall_windows(args)
-    return uninstall_linux(args)
+    return uninstall_linux(args, home)
 
 
 def cmd_status(args):
@@ -544,8 +604,18 @@ def cmd_status(args):
         r = _sh(["schtasks", "/Query", "/TN", WIN_TASK, "/FO", "LIST"])
         print("Service: " + ("installed\n" + r.stdout.strip() if r.returncode == 0 else "not installed"))
     else:
-        r = _sh(["systemctl", "is-active", LINUX_UNIT])
-        print(f"Service: {r.stdout.strip() or 'not installed'}")
+        system_path, user_path = _linux_unit_paths(home)
+        found = False
+        if system_path.exists():
+            found = True
+            r = _sh(["systemctl", "is-active", LINUX_UNIT])
+            print(f"Service: installed (at boot), {r.stdout.strip() or 'unknown'}")
+        if user_path.exists():
+            found = True
+            r = _systemctl_user("is-active", LINUX_UNIT)
+            print(f"Service: installed (at login, user), {r.stdout.strip() or 'unknown'}")
+        if not found:
+            print("Service: not installed")
     st = core.read_status()
     if not st:
         print("Logger: has not run yet")
@@ -599,8 +669,19 @@ def cmd_restart(args):
         print("Restarted." if r.returncode == 0 else
               "Restart failed (installed? run from an administrator prompt):\n" + r.stderr)
         return r.returncode
-    r = _sh(["systemctl", "restart", LINUX_UNIT])
-    print("Restarted." if r.returncode == 0 else "Restart failed (use sudo?):\n" + r.stderr)
+    system_path, user_path = _linux_unit_paths(home)
+    if user_path.exists():
+        r = _systemctl_user("restart", LINUX_UNIT)
+    elif system_path.exists():
+        if os.geteuid() != 0:
+            print(f"Restarting the boot service needs root:\n  sudo {sys.executable} "
+                  f"{Path(__file__).name} restart")
+            return 1
+        r = _sh(["systemctl", "restart", LINUX_UNIT])
+    else:
+        print("No Latency Checker service is installed.")
+        return 1
+    print("Restarted." if r.returncode == 0 else "Restart failed:\n" + r.stderr)
     return r.returncode
 
 

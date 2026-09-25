@@ -16,6 +16,8 @@ import os
 import platform
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -180,9 +182,14 @@ def parse_ping_output(text: str, returncode: int, system: str = SYSTEM):
     return None, "parse error"
 
 
+# Tool output (ping, netstat, ip) in plain English/C locale on macOS and Linux, so the
+# parsers work whatever language the system uses.
+_TOOL_ENV = None if os.name == "nt" else {**os.environ, "LC_ALL": "C", "LANG": "C"}
+
+
 def ping(host: str, timeout_ms: int):
     """Send one ICMP echo using the system ping command."""
-    kwargs = {}
+    kwargs = {} if _TOOL_ENV is None else {"env": _TOOL_ENV}
     if SYSTEM == "Windows":
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
         kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW: no console flash
@@ -196,7 +203,7 @@ def ping(host: str, timeout_ms: int):
     except subprocess.TimeoutExpired:
         return None, "timeout"
     except FileNotFoundError:
-        return None, "ping missing"
+        return None, "ping missing"      # Linux: install iputils-ping (Debian/Ubuntu)
     except Exception as exc:  # pragma: no cover
         return None, f"error: {exc}"
     return parse_ping_output(proc.stdout + proc.stderr, proc.returncode)
@@ -245,6 +252,30 @@ def parse_gateway_windows(route_out: str):
     return (best[0], best[1]) if best else (None, None)
 
 
+def parse_gateway_linux_proc(route_table: str):
+    """Parse /proc/net/route (always present on Linux, no tools needed).
+
+    Default route = destination 00000000 with the UP+GATEWAY flags; the gateway is a
+    little-endian hex IPv4. The lowest metric wins; tunnel/VPN interfaces are skipped.
+    """
+    best = None
+    for line in route_table.splitlines()[1:]:
+        p = line.split()
+        if len(p) < 8:
+            continue
+        iface, dest, gw, flags, metric, mask = p[0], p[1], p[2], p[3], p[6], p[7]
+        try:
+            if dest != "00000000" or mask != "00000000" or (int(flags, 16) & 0x3) != 0x3:
+                continue
+            ip = socket.inet_ntoa(struct.pack("<L", int(gw, 16)))
+            m = int(metric)
+        except (ValueError, struct.error):
+            continue
+        if ip != "0.0.0.0" and not _is_tunnel(iface) and (best is None or m < best[2]):
+            best = (ip, iface, m)
+    return (best[0], best[1]) if best else (None, None)
+
+
 def parse_gateway_linux(ip_out: str):
     """Parse `ip -4 route show default`."""
     best = None
@@ -260,7 +291,7 @@ def parse_gateway_linux(ip_out: str):
 
 
 def _run(cmd):
-    kwargs = {"creationflags": 0x08000000} if SYSTEM == "Windows" else {}
+    kwargs = {"creationflags": 0x08000000} if SYSTEM == "Windows" else {"env": _TOOL_ENV}
     return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=5, **kwargs).stdout
 
@@ -273,6 +304,13 @@ def detect_gateway():
             return gw if gw[0] else parse_gateway_macos_route(_run(["route", "-n", "get", "default"]))
         if SYSTEM == "Windows":
             return parse_gateway_windows(_run(["route", "print", "-4", "0.0.0.0"]))
+        try:
+            with open("/proc/net/route", encoding="ascii", errors="replace") as fh:
+                gw = parse_gateway_linux_proc(fh.read())
+            if gw[0]:
+                return gw
+        except OSError:
+            pass
         return parse_gateway_linux(_run(["ip", "-4", "route", "show", "default"]))
     except Exception:
         return None, None
