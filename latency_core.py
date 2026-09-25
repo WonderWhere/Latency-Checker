@@ -9,11 +9,13 @@ used by the viewer.
 """
 
 import csv
+import gzip
 import ipaddress
 import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -42,6 +44,8 @@ DEFAULT_CONFIG = {
     "log_dir": str(APP_DIR / "logs"),
     "auto_gateway": True,
     "public_ip": True,          # look up and log the public (internet-facing) IP
+    "compress_logs": True,      # gzip finished daily logs (latency_YYYY-MM-DD.csv.gz)
+    "compress_after_days": 1,   # 1 = every day before today; 2 = keep yesterday plain too
     # viewer-only settings
     "span_sec": 3600,
     "theme": "system",          # "system", "dark" or "light"
@@ -393,31 +397,38 @@ class CsvLogger:
         day = since.date()
         today = date.today()
         while day <= today:
-            for ts, key, host, lat in iter_log_file(self.path_for(day)):
-                if key in keys and ts >= since:
-                    yield ts, key, host, lat
+            for path in self.day_files(day):
+                for ts, key, host, lat in iter_log_file(path):
+                    if key in keys and ts >= since:
+                        yield ts, key, host, lat
             day += timedelta(days=1)
+
+    def day_files(self, day):
+        """Existing files holding that day's rows: the archive first, then plain CSV."""
+        base = self.log_dir / f"latency_{day:%Y-%m-%d}.csv"
+        gz = base.with_name(base.name + ".gz")
+        return [p for p in (gz, base) if p.exists()]
+
+
+def open_log(path: Path):
+    """Open a daily log for reading as text — plain .csv or gzip'd .csv.gz alike."""
+    if path.name.endswith(".gz"):
+        return gzip.open(path, "rt", newline="", encoding="utf-8", errors="replace")
+    return open(path, newline="", encoding="utf-8", errors="replace")
 
 
 def iter_log_file(path: Path):
-    """Yield (ts, key, host, latency) for every row of one daily log file."""
+    """Yield (ts, key, host, latency) for every row of one daily log (.csv or .csv.gz)."""
     if not path.exists():
         return
     try:
-        with open(path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                try:
-                    # Files started by v1 have no "role" header; the value then
-                    # lands under the None key.
-                    role = row.get("role") or (row.get(None) or [""])[0]
-                    host = row.get("host") or ""
-                    key = GATEWAY_KEY if role == "gateway" else host
-                    ts = datetime.fromisoformat(row["timestamp"])
-                    lat = row.get("latency_ms") or ""
-                    yield ts, key, host, (float(lat) if lat else None)
-                except (ValueError, KeyError, TypeError):
-                    continue
-    except OSError:
+        with open_log(path) as fh:
+            for row in csv.reader(fh):
+                parsed = parse_row(row)
+                if parsed:
+                    ts, key, host, lat, _status, _pub = parsed
+                    yield ts, key, host, lat
+    except (OSError, EOFError, gzip.BadGzipFile):
         return
 
 
@@ -494,6 +505,138 @@ class LogTail:
 
 
 # --------------------------------------------------------------------------- #
+# Archiving: gzip finished daily logs
+# --------------------------------------------------------------------------- #
+_DAY_RE = re.compile(r"^latency_(\d{4}-\d{2}-\d{2})\.csv(\.part)?$")
+
+
+def _count_lines(fh, chunk=1 << 20):
+    n = 0
+    while True:
+        b = fh.read(chunk)
+        if not b:
+            return n
+        n += b.count(b"\n")
+
+
+def fmt_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def archive_old_logs(log_dir, keep_days: int = 1, log=None):
+    """Compress daily logs older than `keep_days` into latency_YYYY-MM-DD.csv.gz.
+
+    Safe to run while the logger and viewer are running:
+      1. the .csv is renamed to .csv.part first (on Windows this fails while another
+         program has it open → that day is simply retried next time);
+      2. the .gz is written to a temp file (appending to an existing archive of the
+         same day, if there is one), then decompressed again and line-counted;
+      3. only then is it moved into place and the .part removed.
+    Returns (files_compressed, bytes_before, bytes_after).
+    """
+    log_dir = Path(log_dir)
+    say = (log.info if log else (lambda *a: None))
+    warn = (log.warning if log else (lambda *a: None))
+    if not log_dir.is_dir():
+        return 0, 0, 0
+    lock = log_dir / ".archive.lock"
+    try:
+        if lock.exists() and time.time() - lock.stat().st_mtime > 3600:
+            lock.unlink()                               # stale lock from a crash
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        say("archiving already in progress elsewhere — skipped")
+        return 0, 0, 0
+    except OSError as exc:
+        warn("cannot archive in %s: %s", log_dir, exc)
+        return 0, 0, 0
+
+    cutoff = date.today() - timedelta(days=max(1, int(keep_days)) - 1)
+    done, before, after = 0, 0, 0
+    try:
+        for src in sorted(log_dir.iterdir()):
+            m = _DAY_RE.match(src.name)
+            if not m:
+                continue
+            try:
+                day = date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if day >= cutoff:
+                continue                                # today (and kept days) stay plain
+            base = log_dir / f"latency_{m.group(1)}.csv"
+            part = base.with_name(base.name + ".part")
+            gz = base.with_name(base.name + ".gz")
+            tmp = gz.with_name(gz.name + ".tmp")
+            try:
+                if not m.group(2):                      # claim the plain file
+                    if part.exists():
+                        continue                        # handled via the .part entry
+                    os.replace(base, part)
+                size_in = part.stat().st_size
+                old_gz = gz.stat().st_size if gz.exists() else 0
+                expected = 0
+                with gzip.open(tmp, "wb", compresslevel=9) as out:
+                    if gz.exists():                     # same day archived before: keep it
+                        with gzip.open(gz, "rb") as old:
+                            expected += _count_lines(old)
+                        with gzip.open(gz, "rb") as old:
+                            shutil.copyfileobj(old, out)
+                    with open(part, "rb") as fh:
+                        data = fh.read()
+                    if gz.exists() and data.startswith(b"timestamp"):
+                        data = data[data.find(b"\n") + 1:]   # one header is enough
+                    if data and not data.endswith(b"\n"):
+                        data += b"\n"
+                    out.write(data)
+                    expected += data.count(b"\n")
+                with gzip.open(tmp, "rb") as chk:     # verify before replacing anything
+                    got = _count_lines(chk)
+                if got != expected:
+                    raise IOError(f"verification failed ({got} != {expected} lines)")
+                os.replace(tmp, gz)
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                size_out = gz.stat().st_size
+                before += size_in + old_gz
+                after += size_out
+                done += 1
+            except PermissionError:
+                warn("%s is in use — will compress it next time", src.name)
+                if not m.group(2) and part.exists() and not base.exists():
+                    try:
+                        os.replace(part, base)          # give it back untouched
+                    except OSError:
+                        pass
+            except Exception as exc:
+                warn("could not compress %s: %s", src.name, exc)
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                if part.exists() and not base.exists():
+                    try:
+                        os.replace(part, base)
+                    except OSError:
+                        pass
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    if done:
+        say("compressed %d daily log%s: %s → %s", done, "" if done == 1 else "s",
+            fmt_bytes(before), fmt_bytes(after))
+    return done, before, after
+
+
+# --------------------------------------------------------------------------- #
 # Aggregation helpers (averaging for long time ranges)
 # --------------------------------------------------------------------------- #
 def new_acc():
@@ -566,7 +709,8 @@ class HistoryStore:
     def _load(self, day: date):
         raw, mins, gw_events = {}, {}, []
         last_gw = None
-        for ts, key, host, lat in iter_log_file(self.logger.path_for(day)):
+        rows = (r for p in self.logger.day_files(day) for r in iter_log_file(p))
+        for ts, key, host, lat in rows:
             raw.setdefault(key, []).append((ts, lat))
             m = ts.replace(second=0, microsecond=0)
             acc = mins.setdefault(key, {}).get(m)
@@ -591,11 +735,14 @@ class HistoryStore:
         return self.logger.log_dir / ".summary" / f"latency_{day:%Y-%m-%d}.json"
 
     def _src_sig(self, day: date):
-        try:
-            st = self.logger.path_for(day).stat()
-            return [st.st_mtime, st.st_size]
-        except OSError:
-            return None
+        sig = []
+        for p in self.logger.day_files(day):
+            try:
+                st = p.stat()
+                sig.append([p.name, st.st_mtime, st.st_size])
+            except OSError:
+                pass
+        return sig or None
 
     def _save_summary(self, day, mins, gw_events):
         sig = self._src_sig(day)

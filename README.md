@@ -88,6 +88,17 @@ With **Record public IP** switched on (Settings), every log row also stores your
 - Logs: `~/LatencyChecker/logs/latency_YYYY-MM-DD.csv` (one per day). Columns: `timestamp, host, label, latency_ms, status, role, public_ip` (`role` is `gateway` or `target`). Today's file from an older version gets the new header automatically, and your rows are kept. Change the folder with **Change log folder…**.
 - Settings, targets, span and theme: `~/LatencyChecker/config.json` (shared by the logger and the viewer). Set `"theme"` to `"system"`, `"dark"` or `"light"`.
 
+## Log compression
+
+Finished daily logs are compressed automatically to `latency_YYYY-MM-DD.csv.gz`. They typically shrink to about a tenth of their size; in testing, 13.4 MB became 1.2 MB. Today's file stays plain `.csv` while it's being written.
+
+- **When:** the logger compresses when it starts, and again shortly after every midnight. It runs in the background, so pings aren't delayed.
+- **Now:** `python3 latency_logger.py archive` (safe while the service runs, no restart needed), or **Compress old logs** in the viewer's Settings.
+- **Restart the service:** `sudo python3 latency_logger.py restart` (macOS) or `latency_logger.py restart` from an admin prompt (Windows). It compresses again as it starts.
+- **Reading:** the viewer reads `.csv.gz` directly; nothing is unpacked to disk. To look at one yourself, double-click it (macOS Archive Utility and Windows 11 Explorer both open `.gz`), or use `gunzip -k file.csv.gz`.
+- **Safety:** a day's file is claimed first (renamed to `.part`), compressed to a temp file, decompressed again and line-counted, and only then swapped in. A file another program has open (e.g. in Excel on Windows) is skipped and retried next time. After a crash, leftover `.part` files are picked up on the next run.
+- **Settings** in `config.json`: `"compress_logs": false` turns it off. `"compress_after_days": 2` also keeps yesterday uncompressed.
+
 ## Build standalone apps (no Python needed on the target machine)
 
 - **macOS:** `./build_mac.sh` → `dist/Latency Checker.app` (viewer) and `dist/LatencyLogger` (logger). Install the service with `sudo dist/LatencyLogger install`.

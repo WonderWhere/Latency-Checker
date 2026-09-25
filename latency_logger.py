@@ -12,6 +12,11 @@ packages: standard-library Python 3.9+ only.
     python  latency_logger.py install         Windows (from an admin prompt): same
     python3 latency_logger.py install --at-login   start at login instead (no admin needed)
     python3 latency_logger.py uninstall       remove the automatic start
+    python3 latency_logger.py archive         compress finished daily logs now (safe while running)
+    python3 latency_logger.py restart         restart the installed service
+
+Finished daily logs are gzip-compressed automatically (at start-up and after each
+midnight) to latency_YYYY-MM-DD.csv.gz; the viewer reads them transparently.
 
 Settings come from ~/LatencyChecker/config.json and are re-read while running,
 so changes made in the viewer apply within one round.
@@ -29,7 +34,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -91,6 +96,8 @@ class LatencyLogger:
         self._cfg_mtime = object()
         self.csv = None
         self.started = datetime.now()
+        self._archived_on = None
+        self._archiving = False
         self.reload_config()
         self.pubwatch = core.PublicIPWatcher(self)
 
@@ -113,6 +120,8 @@ class LatencyLogger:
         self.timeout_ms = max(100, int(cfg.get("timeout_ms", 1000)))
         self.gateway_enabled = bool(cfg.get("auto_gateway", True))
         self.public_ip_enabled = bool(cfg.get("public_ip", True))
+        self.compress = bool(cfg.get("compress_logs", True))
+        self.compress_after = max(1, int(cfg.get("compress_after_days", 1)))
         log_dir = Path(cfg.get("log_dir") or core.APP_DIR / "logs")
         if self.csv is None or self.csv.log_dir != log_dir:
             self.csv = core.CsvLogger(log_dir)
@@ -159,6 +168,23 @@ class LatencyLogger:
                 log.error("could not write log: %s", exc)
             self.last[key] = [latency, status]
 
+    def maybe_archive(self):
+        """Once at start-up and once after every midnight: gzip finished days (in the background)."""
+        today = date.today()
+        if not self.compress or self._archived_on == today or self._archiving:
+            return
+        self._archived_on = today
+        self._archiving = True
+
+        def work():
+            try:
+                core.archive_old_logs(self.csv.log_dir, self.compress_after, log)
+            except Exception:
+                log.exception("archiving failed")
+            finally:
+                self._archiving = False
+        threading.Thread(target=work, daemon=True, name="archive").start()
+
     def drain_events(self):
         while True:
             try:
@@ -190,6 +216,7 @@ class LatencyLogger:
             try:
                 self.reload_config()
                 self.round()
+                self.maybe_archive()
                 self.drain_events()
                 core.write_status(self.status())
             except Exception:
@@ -535,10 +562,52 @@ def cmd_status(args):
     return 0
 
 
+def cmd_archive(args):
+    """Compress finished daily logs right now (works while the service is running)."""
+    setup_logging(quiet=False)
+    cfg = core.load_config()
+    log_dir = Path(cfg.get("log_dir") or core.APP_DIR / "logs")
+    keep = max(1, int(cfg.get("compress_after_days", 1)))
+    n, before, after = core.archive_old_logs(log_dir, keep, log)
+    if not n:
+        print(f"Nothing to compress in {log_dir} (finished days are already .csv.gz).")
+    else:
+        print(f"Compressed {n} file(s) in {log_dir}: {core.fmt_bytes(before)} → {core.fmt_bytes(after)}")
+    return 0
+
+
+def cmd_restart(args):
+    """Restart the installed service (it archives old logs again as it starts)."""
+    user, home, _, _ = _target_user()
+    if core.SYSTEM == "Darwin":
+        for at_login in (False, True):
+            plist_path, domain = _mac_paths(at_login, home)
+            if plist_path.exists():
+                if not at_login and os.geteuid() != 0:
+                    print(f"Restarting the boot service needs sudo:\n  sudo {sys.executable} "
+                          f"{Path(__file__).name} restart")
+                    return 1
+                r = _sh(["launchctl", "kickstart", "-k", f"{domain}/{SERVICE_LABEL}"])
+                print("Restarted." if r.returncode == 0 else "Restart failed:\n" + r.stderr)
+                return r.returncode
+        print("No Latency Checker service is installed.")
+        return 1
+    if core.SYSTEM == "Windows":
+        _sh(["schtasks", "/End", "/TN", WIN_TASK])
+        time.sleep(2)
+        r = _sh(["schtasks", "/Run", "/TN", WIN_TASK])
+        print("Restarted." if r.returncode == 0 else
+              "Restart failed (installed? run from an administrator prompt):\n" + r.stderr)
+        return r.returncode
+    r = _sh(["systemctl", "restart", LINUX_UNIT])
+    print("Restarted." if r.returncode == 0 else "Restart failed (use sudo?):\n" + r.stderr)
+    return r.returncode
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Latency Checker headless logger")
     ap.add_argument("command", nargs="?", default="run",
-                    choices=["run", "install", "uninstall", "status"])
+                    choices=["run", "install", "uninstall", "status", "archive", "restart"])
     ap.add_argument("--home", help="data folder (default ~/LatencyChecker)")
     ap.add_argument("--quiet", action="store_true", help="no console output (used by the service)")
     ap.add_argument("--at-login", action="store_true",
@@ -547,7 +616,8 @@ def main(argv=None):
     if args.home:
         core.set_home(args.home)
     return {"run": cmd_run, "install": cmd_install, "uninstall": cmd_uninstall,
-            "status": cmd_status}[args.command](args)
+            "status": cmd_status, "archive": cmd_archive,
+            "restart": cmd_restart}[args.command](args)
 
 
 if __name__ == "__main__":

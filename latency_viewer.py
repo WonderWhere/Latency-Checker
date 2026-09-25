@@ -411,6 +411,8 @@ class App:
         logs.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ttk.Button(logs, text="Open log folder", command=self.open_logs).pack(side="left")
         ttk.Button(logs, text="Change…", command=self.change_log_dir).pack(side="left", padx=6)
+        self.archive_btn = ttk.Button(logs, text="Compress old logs", command=self.archive_now)
+        self.archive_btn.pack(side="left")
 
         # Graph
         # "constrained" layout recalculates margins on every draw (incl. window resizes),
@@ -422,7 +424,9 @@ class App:
         cw = self.canvas.get_tk_widget()
         cw.config(highlightthickness=0, bg=self.pt["bg"])
         cw.pack(fill="both", expand=True)
-        cw.bind("<Configure>", lambda e: setattr(self, "dirty", True))
+        # add="+": keep matplotlib's own <Configure> handler (it resizes the figure);
+        # without it the plot stays at its first size when the window grows.
+        cw.bind("<Configure>", lambda e: setattr(self, "dirty", True), add="+")
         self.canvas.mpl_connect("button_press_event", self.on_press)
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("button_release_event", self.on_release)
@@ -611,6 +615,34 @@ class App:
             self.save_config()
             self.dirty = True
             self.set_status(f"The logger will write to {d} from its next round.")
+
+    def archive_now(self):
+        """gzip finished daily logs now (the logger also does this daily by itself)."""
+        import threading
+        self.archive_btn.state(["disabled"])
+        self.set_status("Compressing old daily logs…")
+        keep = max(1, int(self.cfg.get("compress_after_days", 1)))
+
+        def work():
+            try:
+                res = core.archive_old_logs(self.logger.log_dir, keep)
+            except Exception as exc:        # pragma: no cover
+                res = exc
+            self.root.after(0, lambda: self._archive_done(res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _archive_done(self, res):
+        self.archive_btn.state(["!disabled"])
+        if isinstance(res, Exception):
+            self.set_status(f"Compressing failed: {res}")
+            return
+        n, before, after = res
+        if n:
+            self.history.clear()                 # re-read the archives (same data)
+            self.set_status(f"Compressed {n} daily log{'s' if n != 1 else ''}: "
+                            f"{core.fmt_bytes(before)} → {core.fmt_bytes(after)}")
+        else:
+            self.set_status("Nothing to compress — finished days are already archived.")
 
     def open_logs(self):
         path = self.logger.log_dir
