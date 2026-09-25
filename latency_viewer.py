@@ -37,12 +37,12 @@ import latency_core as core  # noqa: E402
 from latency_core import (  # noqa: E402
     AGG_LOSS_MARK, APP_NAME, COLORS, GATEWAY_KEY, GATEWAY_LABEL, MAX_POINTS_PER_TARGET,
     SYSTEM, CsvLogger, HistoryStore, LogTail, acc_add, acc_merge, bucket_size_for,
-    floor_ts, fmt_bucket, new_acc,
+    floor_ts, fmt_bucket, ip_label, is_private_ip, new_acc,
 )
 
 # Settings this window owns in config.json (everything else is left untouched).
 VIEWER_KEYS = ("targets", "interval_sec", "timeout_ms", "log_dir", "auto_gateway",
-               "public_ip", "span_sec", "theme", "log_scale")
+               "public_ip", "span_sec", "theme", "log_scale", "names")
 
 # --------------------------------------------------------------------------- #
 # GUI
@@ -140,6 +140,7 @@ class App:
         self.timeout_ms = int(cfg["timeout_ms"])
         self.gateway_enabled = bool(cfg.get("auto_gateway", True))
         self.public_ip_enabled = bool(cfg.get("public_ip", True))
+        self.names = dict(cfg.get("names") or {})     # ip -> your name for that network
 
     def save_config(self):
         """Merge this window's settings into config.json (the logger reads it)."""
@@ -153,6 +154,7 @@ class App:
             "public_ip": self.public_ip_enabled,
             "theme": self.cfg.get("theme", "system"),
             "log_scale": self.log_scale,
+            "names": self.names,
         }
         try:
             cfg = core.load_config()            # keep anything else in the file as-is
@@ -357,6 +359,8 @@ class App:
             self.tree.heading(c, text=h, anchor="w" if c == "host" else "e")
             self.tree.column(c, width=w, minwidth=40, anchor="w" if c == "host" else "e")
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda e: self.networks_dialog()
+                       if self.tree.identify_row(e.y) == GATEWAY_KEY else None)
         ttk.Label(side, text="Latency in ms · stats cover the range on the graph",
                   style="Muted.TLabel").pack(anchor="w", pady=(4, 10))
 
@@ -413,6 +417,9 @@ class App:
         ttk.Button(logs, text="Change…", command=self.change_log_dir).pack(side="left", padx=6)
         self.archive_btn = ttk.Button(logs, text="Compress old logs", command=self.archive_now)
         self.archive_btn.pack(side="left")
+        ttk.Button(st, text="Networks…  (name your public IPs and gateways)",
+                   command=self.networks_dialog).grid(row=5, column=0, columnspan=3,
+                                                      sticky="w", pady=(8, 0))
 
         # Graph
         # "constrained" layout recalculates margins on every draw (incl. window resizes),
@@ -451,9 +458,9 @@ class App:
             txt = (f"Logger running{' as a service' if st.get('mode') == 'service' else ''}"
                    f" · every {float(st.get('interval_sec', self.interval_sec)):g} s")
             if self.gateway_enabled and self.gateway["ip"]:
-                txt += f"  ·  gateway {self.gateway['ip']}"
+                txt += f"  ·  gateway {ip_label(self.gateway['ip'], self.names)}"
             if self.public_ip_enabled:
-                txt += f"  ·  public IP {self.public_ip or 'checking…'}"
+                txt += f"  ·  public IP {ip_label(self.public_ip, self.names, 'checking…')}"
         elif st:
             age = time.time() - float(st.get("heartbeat", 0))
             txt = f"Logger not running (last seen {self._ago(age)} ago) — showing saved logs"
@@ -537,7 +544,9 @@ class App:
             if not ip:                                   # logger stopped: last one in the log
                 ip, iface = self._gw_last_host or None, None
             shown = f"{ip} ({iface})" if ip and iface else (ip or "–")
-            out.append((GATEWAY_KEY, GATEWAY_LABEL, shown, self.pt["gateway"]))
+            name = self.names.get(ip) if ip else None
+            label = f"{GATEWAY_LABEL} · {name}" if name else GATEWAY_LABEL
+            out.append((GATEWAY_KEY, label, shown, self.pt["gateway"]))
         for i, t in enumerate(self.targets):
             out.append((t["host"], t.get("label") or t["host"], t["host"],
                         COLORS[i % len(COLORS)]))
@@ -615,6 +624,147 @@ class App:
             self.save_config()
             self.dirty = True
             self.set_status(f"The logger will write to {d} from its next round.")
+
+    # ---- networks: name public IPs and local gateways ---------------------- #
+    def networks_dialog(self):
+        import threading
+        if getattr(self, "_net_dlg", None) and self._net_dlg.winfo_exists():
+            self._net_dlg.lift()
+            return
+        dlg = self._net_dlg = tk.Toplevel(self.root)
+        dlg.title("Networks")
+        dlg.transient(self.root)
+        dlg.geometry("820x480")
+        dlg.minsize(640, 360)
+        frm = ttk.Frame(dlg, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Networks you've been on", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(frm, style="Muted.TLabel", wraplength=780, justify="left",
+                  text="Every public IP and local gateway found in your logs. Give them names "
+                       "(e.g. \"Lisbon home – fibre\", \"Office\", \"Phone hotspot\"); names "
+                       "show up in the header, the table, the graph and status messages, "
+                       "for past data too.").pack(anchor="w", pady=(2, 10))
+
+        box = ttk.Frame(frm, style=self.S["card"], padding=6)
+        box.pack(fill="both", expand=True)
+        cols = ("kind", "ip", "name", "first", "last")
+        tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="browse")
+        for c, h, w, st in zip(cols, ("Type", "IP address", "Name", "First seen", "Last seen"),
+                               (105, 135, 250, 130, 130), (0, 0, 1, 0, 0)):
+            tree.heading(c, text=h, anchor="w")
+            tree.column(c, width=w, anchor="w", stretch=bool(st))
+        sb = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        edit = ttk.Frame(frm)
+        edit.pack(fill="x", pady=(10, 0))
+        ttk.Label(edit, text="Name").pack(side="left")
+        name_e = ttk.Entry(edit, width=36)
+        name_e.pack(side="left", padx=8)
+        save_b = ttk.Button(edit, text="Save name", style=self.S["accent"])
+        save_b.pack(side="left")
+        look_b = ttk.Button(edit, text="Look up ISP")
+        look_b.pack(side="left", padx=6)
+        ttk.Button(edit, text="Close", command=dlg.destroy).pack(side="right")
+        msg = tk.StringVar(value="Scanning logs…")
+        ttk.Label(frm, textvariable=msg, style="Muted.TLabel", wraplength=780,
+                  justify="left").pack(anchor="w", pady=(8, 0))
+
+        def fmt(iso):
+            try:
+                return datetime.fromisoformat(iso).strftime("%d %b %Y %H:%M")
+            except Exception:
+                return iso or ""
+
+        def current():
+            sel = tree.selection()
+            return sel[0].split("|", 1) if sel else (None, None)
+
+        def fill(nets):
+            if not dlg.winfo_exists():
+                return
+            # include what the logger sees right now, even if not in the logs yet
+            now = datetime.now().isoformat(timespec="seconds")
+            for kind, ip in (("pub", self.public_ip), ("gw", self.gateway.get("ip"))):
+                if ip and ip not in nets[kind]:
+                    nets[kind][ip] = [now, now, 0]
+            items = [(kind, ip, e) for kind in ("pub", "gw") for ip, e in nets[kind].items()]
+            items.sort(key=lambda x: x[2][1], reverse=True)          # most recent first
+            tree.delete(*tree.get_children())
+            for kind, ip, (first, last, n) in items:
+                tree.insert("", "end", iid=f"{kind}|{ip}",
+                            values=("Public IP" if kind == "pub" else "Local gateway", ip,
+                                    self.names.get(ip, ""), fmt(first), fmt(last)))
+            npub, ngw = len(nets["pub"]), len(nets["gw"])
+            msg.set(f"{npub} public IP{'s' if npub != 1 else ''} and {ngw} local gateway"
+                    f"{'s' if ngw != 1 else ''} found. Select one, type a name, press Save "
+                    "(or Enter). Tip: local gateway addresses like 192.168.1.1 are used by "
+                    "many routers, so public IPs identify a network better.")
+            if items and not tree.selection():
+                tree.selection_set(tree.get_children()[0])
+
+        def on_select(_e=None):
+            kind, ip = current()
+            name_e.delete(0, "end")
+            if ip:
+                name_e.insert(0, self.names.get(ip, ""))
+                look_b.state(["!disabled"] if kind == "pub" and not is_private_ip(ip)
+                             else ["disabled"])
+
+        def save(_e=None):
+            kind, ip = current()
+            if not ip:
+                return
+            name = name_e.get().strip()
+            if name:
+                self.names[ip] = name
+            else:
+                self.names.pop(ip, None)
+            self.save_config()
+            tree.set(f"{kind}|{ip}", "name", name)
+            msg.set(f"Saved: {ip} → {name}" if name else f"Name removed for {ip}")
+            self.update_status_pill()
+            self.dirty = True
+
+        def lookup():
+            kind, ip = current()
+            if not ip:
+                return
+            look_b.state(["disabled"])
+            msg.set(f"Asking ipinfo.io who {ip} belongs to…")
+
+            def work():
+                res = core.lookup_ip_owner(ip)
+
+                def done():
+                    if not dlg.winfo_exists():
+                        return
+                    look_b.state(["!disabled"])
+                    if res:
+                        name_e.delete(0, "end")
+                        name_e.insert(0, res)
+                        msg.set("Suggestion from ipinfo.io — edit it if you like, then Save.")
+                    else:
+                        msg.set("No answer from ipinfo.io (offline, or rate-limited).")
+                self.root.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+        name_e.bind("<Return>", save)
+        save_b.config(command=save)
+        look_b.config(command=lookup)
+
+        def scan():
+            try:
+                nets = core.scan_networks(self.logger)
+            except Exception as exc:          # pragma: no cover
+                err = str(exc)
+                self.root.after(0, lambda: msg.set(f"Couldn't read the logs: {err}"))
+                return
+            self.root.after(0, lambda: fill(nets))
+        threading.Thread(target=scan, daemon=True).start()
 
     def archive_now(self):
         """gzip finished daily logs now (the logger also does this daily by itself)."""
@@ -921,12 +1071,17 @@ class App:
                 if host != self._gw_last_host:
                     if self._gw_last_host is not None:
                         self.gw_events.append((ts, host))      # a real network switch
-                        self.set_status(f"Network change — local gateway is now {host}"
+                        self.set_status(f"Network change — local gateway is now "
+                                        f"{ip_label(host, self.names)}"
                                         if host else "No local gateway — offline?")
                     self._gw_last_host = host
             if pub and pub != self._pub_last:
                 if self._pub_last:
-                    self.set_status(f"Public IP changed: {self._pub_last} → {pub}")
+                    msg = (f"Public IP changed: {ip_label(self._pub_last, self.names)} → "
+                           f"{ip_label(pub, self.names)}")
+                    if pub not in self.names:
+                        msg += "  —  new network? Name it under Settings › Networks…"
+                    self.set_status(msg)
                 self._pub_last = pub
             if key in keys or key == GATEWAY_KEY:
                 self.add_point(ts, key, latency)
@@ -1109,7 +1264,8 @@ class App:
             for ts, ip in changes:
                 ax.axvline(ts, color=pt["muted"], linestyle=(0, (4, 3)), linewidth=1, alpha=0.8)
                 if len(changes) <= 15:
-                    ax.text(ts, 0.98, f" {ip or 'offline'}", transform=ax.get_xaxis_transform(),
+                    ax.text(ts, 0.98, f" {self.names.get(ip) or ip or 'offline'}",
+                            transform=ax.get_xaxis_transform(),
                             rotation=90, va="top", ha="left", fontsize=8, color=pt["muted"])
 
         # Minimal, modern axes styling

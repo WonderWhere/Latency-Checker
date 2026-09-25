@@ -73,6 +73,17 @@ With **Record public IP** switched on (Settings), every log row also stores your
 - After a network switch the column stays blank until the new IP is confirmed, so an old IP is never logged against the new network.
 - The header shows the current public IP, and the status bar tells you when it changes.
 
+### Naming your networks
+
+**Settings › Networks…** lists every public IP and local gateway found in your logs, with first- and last-seen dates. You can also double-click the Local gateway row in the table to open it.
+
+- Select an address, type a name (e.g. "Lisbon home – fibre", "Office", "Phone hotspot") and press **Save name** or Enter.
+- **Look up ISP** suggests a name for a public IP, such as "MEO · Lisbon, PT". It asks ipinfo.io, and only when you click it.
+- Names appear in the header, the gateway row and its legend entry, the dashed network-change markers on the graph, and status messages. That includes past data, because names are applied when the logs are displayed rather than written into them.
+- When the viewer sees a public IP you haven't named yet, the status bar reminds you to name it.
+- Names are stored under `"names"` in `config.json`.
+- Local gateway addresses like 192.168.1.1 are shared by many routers, so a gateway name applies everywhere that address appears. Public IPs identify a network more reliably.
+
 ### Navigating history
 
 - **Span buttons**: 15m · 1h · 6h · 12h · 24h · 7d · 30d.

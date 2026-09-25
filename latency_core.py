@@ -26,7 +26,7 @@ from pathlib import Path
 
 APP_NAME = "Latency Checker"
 SYSTEM = platform.system()  # "Darwin", "Windows", "Linux"
-VERSION = "4.0"
+VERSION = "4.1"
 
 # Data folder (config, status, logs). Override with LATENCYCHECKER_HOME or set_home().
 APP_DIR = Path(os.environ.get("LATENCYCHECKER_HOME") or (Path.home() / "LatencyChecker"))
@@ -417,8 +417,8 @@ def open_log(path: Path):
     return open(path, newline="", encoding="utf-8", errors="replace")
 
 
-def iter_log_file(path: Path):
-    """Yield (ts, key, host, latency) for every row of one daily log (.csv or .csv.gz)."""
+def iter_log_rows(path: Path):
+    """Yield (ts, key, host, latency, status, public_ip) for every row of a daily log."""
     if not path.exists():
         return
     try:
@@ -426,10 +426,126 @@ def iter_log_file(path: Path):
             for row in csv.reader(fh):
                 parsed = parse_row(row)
                 if parsed:
-                    ts, key, host, lat, _status, _pub = parsed
-                    yield ts, key, host, lat
+                    yield parsed
     except (OSError, EOFError, gzip.BadGzipFile):
         return
+
+
+def iter_log_file(path: Path):
+    """Yield (ts, key, host, latency) for every row of one daily log (.csv or .csv.gz)."""
+    for ts, key, host, lat, _status, _pub in iter_log_rows(path):
+        yield ts, key, host, lat
+
+
+# --------------------------------------------------------------------------- #
+# Networks seen (public IPs + local gateways) and their user-given names
+# --------------------------------------------------------------------------- #
+def new_nets():
+    return {"pub": {}, "gw": {}}      # ip -> [first_iso, last_iso, samples]
+
+
+def nets_add(nets, kind, ip, ts_iso):
+    if not ip:
+        return
+    e = nets[kind].get(ip)
+    if e is None:
+        nets[kind][ip] = [ts_iso, ts_iso, 1]
+    else:
+        if ts_iso < e[0]:
+            e[0] = ts_iso
+        if ts_iso > e[1]:
+            e[1] = ts_iso
+        e[2] += 1
+
+
+def nets_merge(into, other):
+    for kind in ("pub", "gw"):
+        for ip, (a, b, n) in other.get(kind, {}).items():
+            e = into[kind].get(ip)
+            if e is None:
+                into[kind][ip] = [a, b, n]
+            else:
+                e[0], e[1], e[2] = min(e[0], a), max(e[1], b), e[2] + n
+
+
+def nets_from_rows(rows):
+    """Inventory from (ts, key, host, latency, status, public_ip) rows."""
+    nets = new_nets()
+    for ts, key, host, _lat, _st, pub in rows:
+        iso = ts.isoformat(timespec="seconds")
+        nets_add(nets, "pub", pub, iso)
+        if key == GATEWAY_KEY:
+            nets_add(nets, "gw", host, iso)
+    return nets
+
+
+def log_days(log_dir):
+    """Every date that has a daily log (plain or compressed), oldest first."""
+    days = set()
+    try:
+        for p in Path(log_dir).iterdir():
+            m = re.match(r"^latency_(\d{4}-\d{2}-\d{2})\.csv(\.gz)?$", p.name)
+            if m:
+                try:
+                    days.add(date.fromisoformat(m.group(1)))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return sorted(days)
+
+
+def scan_networks(logger, progress=None):
+    """All public IPs and local gateways found in the logs, with first/last seen.
+
+    Past days come from the per-day summaries (fast); today is read directly.
+    Uses its own HistoryStore, so it is safe to run in a background thread.
+    """
+    store = HistoryStore(logger)
+    nets = new_nets()
+    days = log_days(logger.log_dir)
+    today = date.today()
+    for i, d in enumerate(days):
+        if d == today:
+            rows = (r for p in logger.day_files(d) for r in iter_log_rows(p))
+            nets_merge(nets, nets_from_rows(rows))
+        else:
+            nets_merge(nets, store.networks(d))
+        if progress:
+            progress(i + 1, len(days))
+    return nets
+
+
+def is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
+def ip_label(ip, names, fallback="–"):
+    """'Lisbon home (46.172.248.156)' when named, else the bare IP."""
+    if not ip:
+        return fallback
+    name = (names or {}).get(ip)
+    return f"{name} ({ip})" if name else ip
+
+
+def lookup_ip_owner(ip: str, timeout: float = 5.0):
+    """Best-effort 'ISP · City, Country' for a public IP (asks ipinfo.io). None on failure."""
+    if not ip or is_private_ip(ip):
+        return None
+    try:
+        req = urllib.request.Request(f"https://ipinfo.io/{ip}/json",
+                                     headers={"User-Agent": "LatencyChecker/1.0",
+                                              "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            info = json.loads(resp.read(4096).decode("utf-8", "replace"))
+    except Exception:
+        return None
+    org = re.sub(r"^AS\d+\s+", "", info.get("org") or "").strip()
+    place = ", ".join(x for x in (info.get("city"), info.get("country")) if x)
+    return " · ".join(x for x in (org, place) if x) or None
 
 
 def parse_row(row):
@@ -699,18 +815,25 @@ class HistoryStore:
         self.logger = logger
         self._minutes = {}          # date -> {key: {minute_ts: acc}}
         self._gw = {}               # date -> [(ts, gateway_ip)]
+        self._nets = {}             # date -> networks seen that day (see new_nets)
         self._raw = OrderedDict()   # date -> {key: [(ts, latency)]}
 
     def clear(self):
         self._minutes.clear()
         self._gw.clear()
+        self._nets.clear()
         self._raw.clear()
 
     def _load(self, day: date):
         raw, mins, gw_events = {}, {}, []
+        nets = new_nets()
         last_gw = None
-        rows = (r for p in self.logger.day_files(day) for r in iter_log_file(p))
-        for ts, key, host, lat in rows:
+        rows = (r for p in self.logger.day_files(day) for r in iter_log_rows(p))
+        for ts, key, host, lat, _status, pub in rows:
+            iso = ts.isoformat(timespec="seconds")
+            nets_add(nets, "pub", pub, iso)
+            if key == GATEWAY_KEY:
+                nets_add(nets, "gw", host, iso)
             raw.setdefault(key, []).append((ts, lat))
             m = ts.replace(second=0, microsecond=0)
             acc = mins.setdefault(key, {}).get(m)
@@ -723,11 +846,12 @@ class HistoryStore:
                 last_gw = host
         self._minutes[day] = mins
         self._gw[day] = gw_events
+        self._nets[day] = nets
         self._raw[day] = raw
         self._raw.move_to_end(day)
         while len(self._raw) > RAW_DAY_CACHE:
             self._raw.popitem(last=False)
-        self._save_summary(day, mins, gw_events)
+        self._save_summary(day, mins, gw_events, nets)
 
     # Per-day summaries (1-minute averages) are cached on disk next to the logs,
     # so week/month views don't have to re-read every raw sample each time.
@@ -744,7 +868,7 @@ class HistoryStore:
                 pass
         return sig or None
 
-    def _save_summary(self, day, mins, gw_events):
+    def _save_summary(self, day, mins, gw_events, nets=None):
         sig = self._src_sig(day)
         if sig is None or day >= date.today():
             return
@@ -754,7 +878,8 @@ class HistoryStore:
             doc = {"src": sig,
                    "minutes": {k: [[m.isoformat(), *acc] for m, acc in v.items()]
                                for k, v in mins.items()},
-                   "gw": [[ts.isoformat(), ip] for ts, ip in gw_events]}
+                   "gw": [[ts.isoformat(), ip] for ts, ip in gw_events],
+                   "nets": nets or new_nets()}
             path.write_text(json.dumps(doc), encoding="utf-8")
         except Exception:
             pass
@@ -768,6 +893,8 @@ class HistoryStore:
                 k: {datetime.fromisoformat(r[0]): list(r[1:]) for r in rows}
                 for k, rows in doc["minutes"].items()}
             self._gw[day] = [(datetime.fromisoformat(t), ip) for t, ip in doc["gw"]]
+            if "nets" in doc:              # summaries written before v4.1 don't have it
+                self._nets[day] = doc["nets"]
             return True
         except Exception:
             return False
@@ -783,6 +910,14 @@ class HistoryStore:
         else:
             self._raw.move_to_end(day)
         return self._raw[day]
+
+    def networks(self, day: date):
+        """Public IPs and local gateways seen on a past day."""
+        if day not in self._nets:
+            self._load_summary(day)
+        if day not in self._nets:
+            self._load(day)
+        return self._nets[day]
 
     def gw_events(self, day: date):
         if day not in self._gw and not self._load_summary(day):
