@@ -346,12 +346,33 @@ def _base_python(windowless=False):
     return str(exe)
 
 
-def _deploy(data_dir: Path):
-    """Copy the logger into <data>/app so the service never depends on this folder.
+DEPLOY_DIR = None     # working directory of the installed service (set by _deploy)
 
-    (On macOS a boot-time service may not read ~/Documents, ~/Desktop or ~/Downloads.)
+
+def _in_venv():
+    return sys.prefix != sys.base_prefix
+
+
+def _deploy(data_dir: Path, in_place: bool = False):
+    """What the service runs.
+
+    Default: copy the logger into <data>/app, so the service never depends on this
+    folder (on macOS a boot-time service may not read ~/Documents, ~/Desktop or
+    ~/Downloads).
+
+    in_place: run THIS folder (e.g. a git checkout) with the interpreter used for the
+    install — normally the checkout's .venv — so `git pull` + restart updates it.
     """
+    global DEPLOY_DIR
+    if in_place and not FROZEN:
+        DEPLOY_DIR = HERE
+        py = sys.executable
+        if os.name == "nt" and py.lower().endswith("python.exe"):
+            w = py[:-10] + "pythonw.exe"
+            py = w if os.path.exists(w) else py
+        return [py, str(HERE / "latency_logger.py")]
     app_dir = data_dir / "app"
+    DEPLOY_DIR = app_dir
     app_dir.mkdir(parents=True, exist_ok=True)
     if FROZEN:
         dst = app_dir / Path(sys.executable).name
@@ -393,7 +414,13 @@ def install_macos(args, user, home, uid, gid, data):
               f"  sudo {sys.executable} {Path(__file__).name} install\n"
               "or use  install --at-login  to start when you log in (no admin needed).")
         return 1
-    prog = _deploy(data) + ["run", "--home", str(data), "--quiet"]
+    if args.in_place and not args.at_login and any(
+            part in HERE.parts for part in ("Documents", "Desktop", "Downloads")):
+        print(f"{HERE} is inside a folder macOS protects from boot-time services "
+              "(Documents/Desktop/Downloads). Clone the repository elsewhere (e.g. ~/src) "
+              "for --in-place, or install without --in-place.")
+        return 1
+    prog = _deploy(data, args.in_place) + ["run", "--home", str(data), "--quiet"]
     plist_path, domain = _mac_paths(args.at_login, home)
     plist = {
         "Label": SERVICE_LABEL,
@@ -401,7 +428,7 @@ def install_macos(args, user, home, uid, gid, data):
         "RunAtLoad": True,
         "KeepAlive": True,                 # restart if it ever exits
         "ThrottleInterval": 10,
-        "WorkingDirectory": str(data / "app"),
+        "WorkingDirectory": str(DEPLOY_DIR),
         "EnvironmentVariables": {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                                  "LATENCYCHECKER_HOME": str(data)},
         "StandardOutPath": str(data / "logger.stdout.log"),
@@ -455,7 +482,7 @@ def install_windows(args, user, home, data):
         print("Starting at boot needs an administrator prompt. Right-click "
               "install_service_windows.bat → Run as administrator, or use  install --at-login.")
         return 1
-    prog = _deploy(data)
+    prog = _deploy(data, args.in_place)
     exe, pre = prog[0], prog[1:]
     arguments = " ".join(f'"{a}"' for a in pre + ["run", "--home", str(data), "--quiet"])
     if args.at_login:
@@ -466,7 +493,7 @@ def install_windows(args, user, home, data):
         principal = "New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest"
     script = f"""
 $ErrorActionPreference = 'Stop'
-$a = New-ScheduledTaskAction -Execute {_ps_quote(exe)} -Argument {_ps_quote(arguments)} -WorkingDirectory {_ps_quote(data / 'app')}
+$a = New-ScheduledTaskAction -Execute {_ps_quote(exe)} -Argument {_ps_quote(arguments)} -WorkingDirectory {_ps_quote(DEPLOY_DIR)}
 $t = {trigger}
 $p = {principal}
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
@@ -509,6 +536,9 @@ def install_linux(args, user, home, uid, gid, data):
         print("systemd was not found. Run the logger from your init system or cron instead:\n"
               f"  {_base_python()} {HERE / 'latency_logger.py'} run --quiet")
         return 1
+    if args.in_place and not _in_venv():
+        print("Note: --in-place without a virtualenv uses the system Python "
+              f"({sys.executable}). The setup script creates .venv for you.")
     if args.at_login and os.geteuid() == 0:
         print("A per-user service must be installed as you, not root. Run without sudo:\n"
               f"  {sys.executable} {Path(__file__).name} install --at-login")
@@ -518,7 +548,7 @@ def install_linux(args, user, home, uid, gid, data):
               f"  sudo {sys.executable} {Path(__file__).name} install\n"
               "or use  install --at-login  for a per-user service (no root needed).")
         return 1
-    prog = _deploy(data) + ["run", "--home", str(data), "--quiet"]
+    prog = _deploy(data, args.in_place) + ["run", "--home", str(data), "--quiet"]
     exec_start = " ".join(f'"{p}"' for p in prog)
     system_path, user_path = _linux_unit_paths(home)
     if args.at_login:
@@ -529,6 +559,7 @@ After=network.target
 [Service]
 Environment=LATENCYCHECKER_HOME={data}
 Environment=LC_ALL=C
+WorkingDirectory={DEPLOY_DIR}
 ExecStart={exec_start}
 Restart=always
 RestartSec=10
@@ -555,6 +586,7 @@ After=network.target
 User={user}
 Environment=LATENCYCHECKER_HOME={data}
 Environment=LC_ALL=C
+WorkingDirectory={DEPLOY_DIR}
 ExecStart={exec_start}
 Restart=always
 RestartSec=10
@@ -644,6 +676,11 @@ def cmd_status(args):
     else:
         system_path, user_path = _linux_unit_paths(home)
         found = False
+        for unit in (system_path, user_path):
+            if unit.exists():
+                line = next((ln for ln in unit.read_text().splitlines()
+                             if ln.startswith("ExecStart=")), "")
+                print(f"Runs:    {line[len('ExecStart='):]}")
         if system_path.exists():
             found = True
             r = _sh(["systemctl", "is-active", LINUX_UNIT])
@@ -842,6 +879,9 @@ def main(argv=None):
     ap.add_argument("--read-only", action="store_true", help="pair: viewer may not change settings")
     ap.add_argument("--home", help="data folder (default ~/LatencyChecker)")
     ap.add_argument("--quiet", action="store_true", help="no console output (used by the service)")
+    ap.add_argument("--in-place", action="store_true",
+                    help="install: run the service from this folder (e.g. a git checkout) with "
+                         "the current Python/.venv, so `git pull` + restart updates it")
     ap.add_argument("--at-login", action="store_true",
                     help="install: start when you log in instead of at boot (no admin rights)")
     args = ap.parse_args(argv)

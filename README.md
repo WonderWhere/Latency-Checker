@@ -32,7 +32,21 @@ Or from an admin prompt: `py -3 latency_logger.py install`.
 
 **Check it:** `python3 latency_logger.py status` shows whether the service is installed, whether the logger is running, the last heartbeat, gateway and public IP.
 **Remove it:** `uninstall_service_mac.command` / `uninstall_service_windows.bat`, or `latency_logger.py uninstall`.
-**Linux (systemd):** run `./install_service_linux.sh`, which asks for sudo. Or run `sudo python3 latency_logger.py install`.
+**Linux, installed from git (recommended; easy updates):**
+
+```
+git clone https://github.com/WonderWhere/Latency-Checker.git ~/latency-checker
+cd ~/latency-checker
+./setup_linux.sh              # asks for sudo once; add --viewer to also set up the viewer
+```
+
+- `setup_linux.sh` creates `./.venv` and installs the systemd service **in place**: it runs `~/latency-checker/.venv/bin/python latency_logger.py` straight from the checkout, as your user, at every boot.
+- **To update:** `./update_linux.sh`. It runs `git pull`, refreshes the `.venv` packages and restarts the service. If a system Python upgrade broke the `.venv`, it rebuilds it. It refuses to run if you've edited files in the checkout.
+- Settings, keys and logs live in `~/LatencyChecker/`, outside the checkout, so updates never touch them.
+- **Private repository?** Add a read-only deploy key: `ssh-keygen -t ed25519 -f ~/.ssh/latency_deploy`, paste the `.pub` into GitHub › Settings › Deploy keys, and clone with the `git@github.com:…` address.
+- **Per-user service without sudo:** `./setup_linux.sh --at-login`.
+
+**Linux (systemd), without git:** run `./install_service_linux.sh`, which asks for sudo. Or run `sudo python3 latency_logger.py install`.
 
 - It installs a system service, `/etc/systemd/system/latency-logger.service`. It starts at every boot, before anyone logs in, and runs as *your* user so the logs belong to you. `Restart=always` brings it back if it stops.
 - The logger is copied to `~/LatencyChecker/app/`, so run the installer again after updating the code.

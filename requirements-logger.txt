@@ -1,0 +1,3 @@
+# The logger itself needs only the Python standard library.
+# Optional: lets the logger create its TLS certificate for remote access without openssl.
+cryptography>=41

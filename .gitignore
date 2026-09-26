@@ -1,4 +1,10 @@
-__pycache__/*.pyc
-__pycache__/latency_core.cpython-310.pyc
-__pycache__/latency_core.cpython-314.pyc
-__pycache__/latency_viewer.cpython-310.pyc
+# Local environments and build output — never commit these
+.venv/
+.venv-build/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+*.tar.gz
+.DS_Store

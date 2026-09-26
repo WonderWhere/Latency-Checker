@@ -18,11 +18,9 @@ command -v python3 >/dev/null || { say "Python 3 is required.
 $hint"; exit 1; }
 python3 -c "import tkinter" 2>/dev/null || { say "Tkinter (the Python GUI toolkit) is missing.
 $hint"; exit 1; }
-if [ ! -x .venv/bin/python ]; then
-  echo "First run: setting up Python packages…"
-  python3 -m venv .venv >>"$LOG" 2>&1 || { rm -rf .venv; say "Could not create a virtualenv.
+source ./venv_linux.sh
+ensure_venv >>"$LOG" 2>&1 || { say "Could not create a virtualenv.
 $hint"; exit 1; }
-fi
 if [ ! -f .venv/.deps-ok ] || [ requirements.txt -nt .venv/.deps-ok ]; then
   .venv/bin/pip install -q --disable-pip-version-check -r requirements.txt >>"$LOG" 2>&1 \
     && touch .venv/.deps-ok || { say "Installing packages failed — see $LOG"; exit 1; }
