@@ -1,1 +1,4 @@
 __pycache__/*.pyc
+__pycache__/latency_core.cpython-310.pyc
+__pycache__/latency_core.cpython-314.pyc
+__pycache__/latency_viewer.cpython-310.pyc
