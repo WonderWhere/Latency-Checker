@@ -16,8 +16,8 @@ import re
 import subprocess
 import sys
 import time
-from collections import OrderedDict, deque
-from datetime import date, datetime, timedelta
+from collections import OrderedDict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -34,10 +34,10 @@ from matplotlib.figure import Figure  # noqa: E402
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 sys.path.insert(0, str(HERE))
 import latency_core as core  # noqa: E402
+import latency_sources as sources  # noqa: E402
 from latency_core import (  # noqa: E402
-    AGG_LOSS_MARK, APP_NAME, COLORS, GATEWAY_KEY, GATEWAY_LABEL, MAX_POINTS_PER_TARGET,
-    SYSTEM, CsvLogger, HistoryStore, LogTail, acc_add, acc_merge, bucket_size_for,
-    floor_ts, fmt_bucket, ip_label, is_private_ip, new_acc,
+    AGG_LOSS_MARK, APP_NAME, COLORS, GATEWAY_KEY, GATEWAY_LABEL,
+    SYSTEM, acc_add, acc_merge, bucket_size_for, fmt_bucket, ip_label, is_private_ip, new_acc,
 )
 
 # Settings this window owns in config.json (everything else is left untouched).
@@ -72,6 +72,11 @@ PLOT_THEME = {
 }
 
 
+def json_equal(a, b) -> bool:
+    import json
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def span_label(secs: float) -> str:
     for k, v in SPAN_PRESETS.items():
         if abs(v - secs) < 1:
@@ -96,28 +101,27 @@ def parse_when(txt: str) -> datetime:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.cfg = core.load_config()
+        self.prefs = sources.Prefs()
+        self.sources = sources.make_sources(self.prefs)     # id -> Local/RemoteSource
+        self.sd = {}                                         # id -> SourceData (loaded lazily)
+        sel = self.prefs.get("selected", "local")
+        self.cur = self.sdata(sel if sel in self.sources else "local")
+        self.compare = False
+        self.compare_key = None
+        self.cfg = self.source.get_config()
         self.apply_cfg(self.cfg)
+        self._cfg_ver = self.source.config_version()
         self.gateway = {"ip": None, "iface": None}
         self.public_ip = None
-        self.logger = CsvLogger(Path(self.cfg["log_dir"]))
-        self.history = HistoryStore(self.logger)
-        self.tail = LogTail(self.logger)
-        self.data = {}              # key -> deque[(datetime, latency|None)]  (recent, in memory)
-        self.gw_events = deque(maxlen=5000)   # [(ts, new_gateway_ip)]
-        self._gw_last_host = None   # last gateway IP seen in the log (change markers)
-        self._pub_last = None       # last public IP seen in the log
-        self.last_status = {}       # key -> status str
-        self.status = None          # logger heartbeat (status.json)
+        self.status = None          # logger heartbeat of the selected location
         self.logger_ok = False
-        self._cfg_mtime = core.config_mtime()
         self._spawned = None
-        self.span_sec = float(self.cfg["span_sec"])
-        self.log_scale = bool(self.cfg.get("log_scale", False))
+        self.span_sec = float(self.prefs.get("span_sec", 3600))
+        self.log_scale = bool(self.prefs.get("log_scale", False))
         self.view_end = None        # None = live (window ends "now"); else a datetime
         self.dirty = True
         self._last_draw = 0.0
-        self._drag = None           # (x0, patch) while drag-selecting on the graph
+        self._drag = None           # drag-selection on the graph
         self._dots = {}
         self._tick = 0
 
@@ -127,11 +131,49 @@ class App:
         self.theme = self.resolve_theme()
         self.setup_style()
         self.build_ui()
-        self.load_recent()
-        self.tail.skip_to_end()
+        for src in self.sources.values():
+            src.start()                                      # remote locations sync in background
+        n = self.cur.load_recent()
+        if n:
+            self.set_status(f"Loaded {n:,} earlier results from the logs.")
         self.refresh_logger_status()
+        self.update_location_ui()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(300, self.poll)
+
+    # ---- locations ------------------------------------------------------- #
+    @property
+    def source(self):
+        return self.cur.source
+
+    def sdata(self, sid):
+        d = self.sd.get(sid)
+        if d is None:
+            d = self.sd[sid] = sources.SourceData(self.sources[sid])
+        return d
+
+    # Existing code talks about "the" logger/history/data: that's the selected location.
+    logger = property(lambda self: self.cur.logger)
+    history = property(lambda self: self.cur.history)
+    data = property(lambda self: self.cur.data)
+    gw_events = property(lambda self: self.cur.gw_events)
+    last_status = property(lambda self: self.cur.last_status)
+    _gw_last_host = property(lambda self: self.cur.gw_last_host)
+
+    def now(self):
+        """The time axis: the selected location's clock (viewer clock when comparing)."""
+        return datetime.now() if self.compare else self.cur.now()
+
+    def today(self):
+        return self.now().date()
+
+    @property
+    def is_local(self):
+        return self.source.kind == "local"
+
+    @property
+    def can_edit(self):
+        return not self.compare and self.source.role != "read"
 
     # ---- config ---------------------------------------------------------- #
     def apply_cfg(self, cfg):
@@ -142,54 +184,59 @@ class App:
         self.public_ip_enabled = bool(cfg.get("public_ip", True))
         self.names = dict(cfg.get("names") or {})     # ip -> your name for that network
 
+    LOGGER_KEYS = ("targets", "interval_sec", "timeout_ms", "auto_gateway", "public_ip", "names")
+
     def save_config(self):
-        """Merge this window's settings into config.json (the logger reads it)."""
-        mine = {
-            "targets": self.targets,
-            "interval_sec": self.interval_sec,
-            "timeout_ms": self.timeout_ms,
-            "log_dir": str(self.logger.log_dir),
-            "span_sec": self.span_sec,
-            "auto_gateway": self.gateway_enabled,
-            "public_ip": self.public_ip_enabled,
-            "theme": self.cfg.get("theme", "system"),
-            "log_scale": self.log_scale,
-            "names": self.names,
-        }
+        """Viewer settings → viewer.json; logger settings → the selected location's logger."""
+        self.prefs.set(span_sec=self.span_sec, log_scale=self.log_scale,
+                       theme=self.prefs.get("theme", "system"))
+        mine = {k: getattr(self, {"auto_gateway": "gateway_enabled",
+                                  "public_ip": "public_ip_enabled"}.get(k, k))
+                for k in self.LOGGER_KEYS}
+        if self.is_local:
+            mine["log_dir"] = str(self.logger.log_dir)
+        if json_equal(mine, {k: self.cfg.get(k) for k in mine}):
+            return
+        if not self.is_local and self.source.role == "read":
+            self.set_status(f"{self.source.name} is paired read-only — changes aren't sent.")
+            return
+
+        def done(err):
+            self.root.after(0, lambda: self.set_status(
+                f"Couldn't save to {self.source.name}: {err}" if err else
+                ("" if self.is_local else f"Saved to {self.source.name}'s logger.")))
         try:
-            cfg = core.load_config()            # keep anything else in the file as-is
-            cfg.update(mine)
-            core.save_config(cfg)
-            self.cfg = cfg
-            self._cfg_mtime = core.config_mtime()
+            self.cfg.update(mine)
+            self.source.save_config(mine, on_done=done)
+            self._cfg_ver = self.source.config_version()
         except Exception as exc:
             self.set_status(f"Could not save config: {exc}")
 
     def check_config_changed(self):
-        """Someone else (another viewer, a text editor) changed config.json."""
-        m = core.config_mtime()
-        if m == self._cfg_mtime:
+        """The selected location's config changed elsewhere (logger, another viewer, editor)."""
+        v = self.source.config_version()
+        if v == self._cfg_ver:
             return
-        self._cfg_mtime = m
-        cfg = core.load_config()
+        self._cfg_ver = v
+        cfg = self.source.get_config()
+        old_dir = self.logger.log_dir
         self.cfg = cfg
         self.apply_cfg(cfg)
+        self.sync_setting_widgets()
+        if self.is_local and Path(cfg["log_dir"]) != old_dir:
+            self.cur.reset()
+            self.cur.load_recent()
+        self.dirty = True
+
+    def sync_setting_widgets(self):
         self.interval_var.set(f"{self.interval_sec:g}")
         self.timeout_var.set(str(self.timeout_ms))
         self.gw_var.set(self.gateway_enabled)
         self.pub_var.set(self.public_ip_enabled)
-        self.log_scale = bool(cfg.get("log_scale", self.log_scale))
-        self.log_var.set(self.log_scale)
-        if Path(cfg["log_dir"]) != self.logger.log_dir:
-            self.logger.log_dir = Path(cfg["log_dir"])
-            self.history.clear()
-            self.tail = LogTail(self.logger)
-            self.tail.skip_to_end()
-        self.dirty = True
 
     # ---- theme ----------------------------------------------------------- #
     def resolve_theme(self):
-        pref = self.cfg.get("theme", "system")
+        pref = self.prefs.get("theme", "system")
         if pref in ("dark", "light"):
             return pref
         try:
@@ -260,9 +307,8 @@ class App:
 
     def toggle_theme(self):
         self.theme = "light" if self.theme == "dark" else "dark"
-        self.cfg["theme"] = self.theme
+        self.prefs.set(theme=self.theme)
         self.apply_theme()
-        self.save_config()
 
     def apply_theme(self):
         if sv_ttk:
@@ -309,6 +355,14 @@ class App:
         self.start_btn = ttk.Button(head, text="Start logger", width=12, style=self.S["accent"],
                                     command=self.start_logger)
         self.start_btn.pack(side="right", padx=(0, 8))
+        self.loc_var = tk.StringVar()
+        self.loc_sel = tk.StringVar(value=self.cur.source.id)
+        self.compare_var = tk.BooleanVar(value=False)
+        self.loc_menu = tk.Menu(self.root, tearoff=False, postcommand=self.build_location_menu)
+        self.loc_btn = ttk.Menubutton(head, textvariable=self.loc_var, menu=self.loc_menu,
+                                      width=26)
+        self.loc_btn.pack(side="right", padx=(0, 10))
+        ttk.Label(head, text="Location", style="Sub.TLabel").pack(side="right", padx=(0, 6))
 
         # Time-range toolbar -------------------------------------------------
         bar = ttk.Frame(outer)
@@ -332,6 +386,15 @@ class App:
         ttk.Checkbutton(bar, text="Log scale", variable=self.log_var, style=self.S["toggle"],
                         command=self.on_log_toggle).pack(side="left")
 
+        self.cmp_frame = ttk.Frame(bar)
+        ttk.Separator(self.cmp_frame, orient="vertical").pack(side="left", fill="y", padx=12)
+        ttk.Label(self.cmp_frame, text="Compare").pack(side="left", padx=(0, 6))
+        self.cmp_var = tk.StringVar()
+        self.cmp_box = ttk.Combobox(self.cmp_frame, textvariable=self.cmp_var, state="readonly",
+                                    width=30)
+        self.cmp_box.pack(side="left")
+        self.cmp_box.bind("<<ComboboxSelected>>", lambda e: self.on_compare_target())
+        self._cmp_map = {}
         self.range_var = tk.StringVar()
         ttk.Label(bar, textvariable=self.range_var, style="Sub.TLabel").pack(side="right")
 
@@ -374,9 +437,10 @@ class App:
         self.host_entry.grid(row=1, column=0, sticky="ew")
         self.label_entry = ttk.Entry(add)
         self.label_entry.grid(row=1, column=1, sticky="ew", padx=(6, 0))
-        ttk.Button(add, text="Add", style=self.S["accent"], command=self.add_target).grid(
-            row=1, column=2, padx=(6, 0))
-        ttk.Button(add, text="Remove", command=self.remove_target).grid(row=1, column=3, padx=(6, 0))
+        add_b = ttk.Button(add, text="Add", style=self.S["accent"], command=self.add_target)
+        add_b.grid(row=1, column=2, padx=(6, 0))
+        rem_b = ttk.Button(add, text="Remove", command=self.remove_target)
+        rem_b.grid(row=1, column=3, padx=(6, 0))
         self.host_entry.bind("<Return>", lambda e: self.add_target())
         self.label_entry.bind("<Return>", lambda e: self.add_target())
 
@@ -386,13 +450,13 @@ class App:
         st.pack(fill="x")
         st.columnconfigure(1, weight=1)
         self.gw_var = tk.BooleanVar(value=self.gateway_enabled)
-        ttk.Checkbutton(st, text="Auto-detect local gateway", variable=self.gw_var,
-                        style=self.S["switch"], command=self.on_gateway_toggle).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        gw_c = ttk.Checkbutton(st, text="Auto-detect local gateway", variable=self.gw_var,
+                               style=self.S["switch"], command=self.on_gateway_toggle)
+        gw_c.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
         self.pub_var = tk.BooleanVar(value=self.public_ip_enabled)
-        ttk.Checkbutton(st, text="Record public IP", variable=self.pub_var,
-                        style=self.S["switch"], command=self.on_public_ip_toggle).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        pub_c = ttk.Checkbutton(st, text="Record public IP", variable=self.pub_var,
+                                style=self.S["switch"], command=self.on_public_ip_toggle)
+        pub_c.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         ttk.Label(st, text="Ping every").grid(row=2, column=0, sticky="w")
         self.interval_var = tk.StringVar(value=f"{self.interval_sec:g}")
@@ -413,13 +477,18 @@ class App:
 
         logs = ttk.Frame(st)
         logs.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        ttk.Button(logs, text="Open log folder", command=self.open_logs).pack(side="left")
-        ttk.Button(logs, text="Change…", command=self.change_log_dir).pack(side="left", padx=6)
+        self.open_btn = ttk.Button(logs, text="Open log folder", command=self.open_logs)
+        self.open_btn.pack(side="left")
+        self.change_btn = ttk.Button(logs, text="Change…", command=self.change_log_dir)
+        self.change_btn.pack(side="left", padx=6)
         self.archive_btn = ttk.Button(logs, text="Compress old logs", command=self.archive_now)
         self.archive_btn.pack(side="left")
-        ttk.Button(st, text="Networks…  (name your public IPs and gateways)",
-                   command=self.networks_dialog).grid(row=5, column=0, columnspan=3,
-                                                      sticky="w", pady=(8, 0))
+        net_b = ttk.Button(st, text="Networks…  (name your public IPs and gateways)",
+                           command=self.networks_dialog)
+        net_b.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        # disabled in compare mode and for read-only remote locations
+        self._edit_widgets = (add_b, rem_b, gw_c, pub_c, sp, sp2, net_b,
+                              self.host_entry, self.label_entry)
 
         # Graph
         # "constrained" layout recalculates margins on every draw (incl. window resizes),
@@ -452,23 +521,52 @@ class App:
 
     def update_status_pill(self):
         ok = self.logger_ok
-        self.pill_dot.config(foreground=self.pt["ok"] if ok else self.pt["bad"])
         st = self.status or {}
+        src = self.source
+        where = "" if self.is_local else f"{src.name}: "
+        if self.compare:
+            n_ok = sum(1 for sid in self.compare_ids() if self.source_alive(sid))
+            n = len(self.compare_ids())
+            self.pill_dot.config(foreground=self.pt["ok"] if n_ok == n else self.pt["bad"])
+            self.pill_text.config(text=f"Comparing {n} locations — {n_ok} logger"
+                                       f"{'s' if n_ok != 1 else ''} live · times on this "
+                                       "computer's clock")
+            self._set_start_btn(None)
+            return
+        self.pill_dot.config(foreground=self.pt["ok"] if ok else self.pt["bad"])
         if ok:
-            txt = (f"Logger running{' as a service' if st.get('mode') == 'service' else ''}"
+            mode = ("remote" if not self.is_local else
+                    "as a service" if st.get("mode") == "service" else "")
+            txt = (f"{where}Logger running{(' ' + mode) if mode else ''}"
                    f" · every {float(st.get('interval_sec', self.interval_sec)):g} s")
             if self.gateway_enabled and self.gateway["ip"]:
                 txt += f"  ·  gateway {ip_label(self.gateway['ip'], self.names)}"
             if self.public_ip_enabled:
                 txt += f"  ·  public IP {ip_label(self.public_ip, self.names, 'checking…')}"
+            if not self.is_local and src.role == "read":
+                txt += "  ·  read-only"
+        elif not self.is_local and not src.reachable and not src.error and not src.last_ok:
+            txt = f"{where}connecting…"
+        elif not self.is_local and not src.reachable:
+            seen = (f"last contact {self._ago(time.time() - src.last_ok)} ago"
+                    if src.last_ok else "not reached yet")
+            txt = f"{where}{src.error or 'unreachable'} — {seen}; showing cached data"
         elif st:
             age = time.time() - float(st.get("heartbeat", 0))
-            txt = f"Logger not running (last seen {self._ago(age)} ago) — showing saved logs"
+            txt = f"{where}Logger not running (last seen {self._ago(age)} ago) — showing saved logs"
         else:
             txt = "Logger not running — press Start logger, or install it as a service"
+        if not self.is_local and src.syncing:
+            txt += "  ·  syncing history…"
         self.pill_text.config(text=txt)
+        self._set_start_btn(ok)
+
+    def _set_start_btn(self, ok):
         try:
-            if ok:
+            if self.compare or not self.is_local:
+                self.start_btn.config(text="Remote" if not self.compare else "Comparing")
+                self.start_btn.state(["disabled"])
+            elif ok:
                 self.start_btn.config(text="Logger running")
                 self.start_btn.state(["disabled"])
             else:
@@ -476,6 +574,10 @@ class App:
                 self.start_btn.state(["!disabled"])
         except Exception:
             pass
+
+    def source_alive(self, sid):
+        src = self.sources[sid]
+        return (src.reachable or src.kind == "local") and core.logger_alive(src.read_status())
 
     @staticmethod
     def _ago(secs):
@@ -488,9 +590,9 @@ class App:
         return f"{secs / 86400:.0f} days"
 
     def refresh_logger_status(self):
-        self.status = core.read_status()
+        self.status = self.source.read_status()
         was = self.logger_ok
-        self.logger_ok = core.logger_alive(self.status)
+        self.logger_ok = self.source_alive(self.source.id)
         if self.status and self.logger_ok:
             gw = self.status.get("gateway") or {}
             self.gateway = {"ip": gw.get("ip"), "iface": gw.get("iface")}
@@ -501,7 +603,7 @@ class App:
 
     def start_logger(self):
         """Run the logger in the background (for when it isn't installed as a service)."""
-        if self.logger_ok:
+        if self.logger_ok or not self.is_local or self.compare:
             return
         if getattr(sys, "frozen", False):
             name = "LatencyLogger.exe" if SYSTEM == "Windows" else "LatencyLogger"
@@ -538,6 +640,8 @@ class App:
     # ---- rows (gateway + user targets) ----------------------------------- #
     def rows(self):
         """[(key, label, host_display, color)] in display order."""
+        if self.compare:
+            return self.compare_rows()
         out = []
         if self.gateway_enabled:
             ip, iface = self.gateway["ip"], self.gateway["iface"]
@@ -553,10 +657,382 @@ class App:
         return out
 
     def keys(self):
+        if self.compare:
+            return [self.compare_key]
         return [r[0] for r in self.rows()]
+
+    # ---- compare mode ---------------------------------------------------- #
+    def compare_ids(self):
+        return list(self.sources)
+
+    def compare_rows(self):
+        out = []
+        for i, sid in enumerate(self.compare_ids()):
+            src = self.sources[sid]
+            cfg = src.get_config()
+            key = self.compare_key
+            if key == GATEWAY_KEY:
+                if not cfg.get("auto_gateway", True):
+                    continue
+                sd = self.sdata(sid)
+                st = src.read_status() or {}
+                ip = ((st.get("gateway") or {}).get("ip")) or sd.gw_last_host or "–"
+                shown = ip_label(ip, cfg.get("names") or {})
+            else:
+                if not any(t.get("host") == key for t in cfg.get("targets", [])):
+                    continue
+                shown = key
+            out.append((sid, src.name, shown, COLORS[i % len(COLORS)]))
+        return out
+
+    def compare_choices(self):
+        """[(display, key)] – the local gateway plus every target any location pings."""
+        seen, out = set(), [("Local gateway (each location's own)", GATEWAY_KEY)]
+        for sid in self.compare_ids():
+            for t in self.sources[sid].get_config().get("targets", []):
+                h = t.get("host")
+                if h and h not in seen:
+                    seen.add(h)
+                    lab = t.get("label") or h
+                    out.append((f"{lab} ({h})" if lab != h else h, h))
+        return out
+
+    def set_compare(self, on):
+        if on and len(self.sources) < 2:
+            messagebox.showinfo(APP_NAME, "Add another location first (Location › Add location…).")
+            self.compare_var.set(False)
+            return
+        self.compare = bool(on)
+        self.compare_var.set(self.compare)
+        if self.compare:
+            for sid in self.compare_ids():
+                d = self.sdata(sid)
+                if not d.loaded:
+                    d.load_recent()
+            choices = self.compare_choices()
+            self._cmp_map = {lab: key for lab, key in choices}
+            self.cmp_box.config(values=[lab for lab, _ in choices])
+            keep = next((lab for lab, key in choices if key == self.compare_key), None)
+            if keep is None:                     # default: first internet target
+                keep = choices[1][0] if len(choices) > 1 else choices[0][0]
+            self.cmp_var.set(keep)
+            self.compare_key = self._cmp_map[keep]
+            self.cmp_frame.pack(side="left")
+        else:
+            self.cmp_frame.pack_forget()
+        self.view_end = None
+        self.tree.delete(*self.tree.get_children())
+        self.update_location_ui()
+        self.refresh_logger_status()
+        self.dirty = True
+
+    def on_compare_target(self):
+        self.compare_key = self._cmp_map.get(self.cmp_var.get(), self.compare_key)
+        self.tree.delete(*self.tree.get_children())
+        self.dirty = True
+
+    # ---- location picker ------------------------------------------------- #
+    def location_label(self, sid):
+        src = self.sources[sid]
+        if src.kind == "local":
+            state = "this computer"
+        elif src.reachable:
+            state = "online" if core.logger_alive(src.read_status()) else "logger stopped"
+        else:
+            state = "offline"
+        return f"{src.name}  —  {state}"
+
+    def build_location_menu(self):
+        m = self.loc_menu
+        m.delete(0, "end")
+        for sid in self.sources:
+            m.add_radiobutton(label=self.location_label(sid), variable=self.loc_sel, value=sid,
+                              command=lambda s=sid: self.select_source(s))
+        m.add_separator()
+        m.add_checkbutton(label="Compare locations", variable=self.compare_var,
+                          command=lambda: self.set_compare(self.compare_var.get()))
+        m.add_separator()
+        m.add_command(label="Add location…", command=self.add_location_dialog)
+        m.add_command(label="Manage locations…", command=self.manage_locations_dialog)
+
+    def update_location_ui(self):
+        self.loc_var.set("All locations (compare)" if self.compare else self.source.name)
+        self.loc_sel.set(self.source.id)
+        local_only = self.is_local and not self.compare
+        for b in (self.open_btn, self.change_btn, self.archive_btn):
+            try:
+                b.state(["!disabled"] if local_only else ["disabled"])
+            except Exception:
+                pass
+        for w in getattr(self, "_edit_widgets", ()):
+            try:
+                w.state(["!disabled"] if self.can_edit else ["disabled"])
+            except Exception:
+                pass
+
+    def select_source(self, sid):
+        if sid not in self.sources:
+            return
+        if self.compare:
+            self.set_compare(False)
+        self.cur = self.sdata(sid)
+        if not self.cur.loaded:
+            self.cur.load_recent()
+        self.prefs.set(selected=sid)
+        self.cfg = self.source.get_config()
+        self.apply_cfg(self.cfg)
+        self._cfg_ver = self.source.config_version()
+        self.sync_setting_widgets()
+        self.gateway, self.public_ip = {"ip": None, "iface": None}, None
+        self.view_end = None
+        self.tree.delete(*self.tree.get_children())
+        self.refresh_logger_status()
+        self.update_location_ui()
+        self.set_status(f"Showing {self.source.name}" + (
+            "" if self.is_local else
+            f" (times in that location's clock{self._offset_note(self.source)})"))
+        self.dirty = True
+
+    @staticmethod
+    def _offset_note(src):
+        off = src.offset.total_seconds()
+        if abs(off) < 90:
+            return ""
+        h, m = divmod(int(abs(off)) // 60, 60)
+        return f", {'+' if off > 0 else '−'}{h}:{m:02d} from here"
+
+    # ---- add / manage locations ------------------------------------------ #
+    def _dialog(self, title, size="560x420"):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.geometry(size)
+        frm = ttk.Frame(dlg, padding=18)
+        frm.pack(fill="both", expand=True)
+        return dlg, frm
+
+    def add_location_dialog(self, prefill=None):
+        import threading
+        import latency_remote as R
+        dlg, frm = self._dialog("Add location", "600x470")
+        ttk.Label(frm, text="Add a remote location", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(frm, style="Muted.TLabel", wraplength=560, justify="left",
+                  text="On the other machine run   latency_logger.py remote enable   once, then "
+                       "latency_logger.py pair   — it prints the address, a one-time code and the "
+                       "certificate fingerprint.").pack(anchor="w", pady=(2, 12))
+        grid = ttk.Frame(frm)
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+        fields = {}
+        for r, (key, label, default) in enumerate([
+                ("host", "Address (host or IP)", (prefill or {}).get("host", "")),
+                ("port", "Port", str((prefill or {}).get("port", R.DEFAULT_PORT))),
+                ("code", "Pairing code", ""),
+                ("name", "Name (optional)", (prefill or {}).get("name", ""))]):
+            ttk.Label(grid, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            e = ttk.Entry(grid, width=34)
+            e.insert(0, default)
+            e.grid(row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
+            fields[key] = e
+        fp_var = tk.StringVar()
+        msg_var = tk.StringVar()
+        ttk.Label(frm, textvariable=fp_var, wraplength=560, justify="left",
+                  font=("Courier", 11)).pack(anchor="w", pady=(12, 0))
+        ttk.Label(frm, textvariable=msg_var, style="Muted.TLabel", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(6, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        pair_b = ttk.Button(btns, text="Fingerprint matches — Pair", style=self.S["accent"])
+        pair_b.pack(side="right", padx=6)
+        pair_b.state(["disabled"])
+        conn_b = ttk.Button(btns, text="Connect", style=self.S["accent"])
+        conn_b.pack(side="left")
+        state = {}
+
+        def ui(fn):
+            self.root.after(0, lambda: dlg.winfo_exists() and fn())
+
+        def connect():
+            host = fields["host"].get().strip()
+            try:
+                port = int(fields["port"].get().strip() or R.DEFAULT_PORT)
+            except ValueError:
+                msg_var.set("The port must be a number.")
+                return
+            if not host:
+                msg_var.set("Enter the logger machine's address.")
+                return
+            conn_b.state(["disabled"])
+            msg_var.set(f"Connecting to {host}:{port}…")
+
+            def work():
+                try:
+                    fp, hello = R.probe(host, port)
+                except Exception as exc:
+                    err = str(exc)
+
+                    def fail():
+                        conn_b.state(["!disabled"])
+                        msg_var.set(f"Couldn't reach a logger there: {err}")
+                    return ui(fail)
+
+                def ok():
+                    state.update(host=host, port=port, fp=fp)
+                    fp_var.set("Certificate fingerprint:\n" + fp)
+                    msg_var.set(f"Connected (logger {hello.get('version')}). Compare the "
+                                "fingerprint with the one printed by  latency_logger.py pair  on "
+                                "that machine. Only pair if they are identical.")
+                    conn_b.state(["!disabled"])
+                    pair_b.state(["!disabled"])
+                ui(ok)
+            threading.Thread(target=work, daemon=True).start()
+
+        def pair():
+            code = fields["code"].get().strip()
+            if not code:
+                msg_var.set("Enter the pairing code shown by  latency_logger.py pair.")
+                return
+            pair_b.state(["disabled"])
+            msg_var.set("Pairing…")
+            host, port, fp = state["host"], state["port"], state["fp"]
+            viewer_name = f"viewer on {os.uname().nodename if hasattr(os, 'uname') else 'Windows'}"
+
+            def work():
+                try:
+                    res = R.RemoteClient(host, port, fp).pair(code, viewer_name)
+                except Exception as exc:
+                    err = getattr(exc, "msg", None) or str(exc)
+
+                    def fail():
+                        pair_b.state(["!disabled"])
+                        msg_var.set(f"Pairing failed: {err}")
+                    return ui(fail)
+
+                def ok():
+                    entry = {"id": R.b64id(f"{host}:{port}:{fp}:{time.time()}"),
+                             "name": fields["name"].get().strip() or res.get("location") or host,
+                             "host": host, "port": port, "fingerprint": fp,
+                             "token": res["token"], "role": res.get("role", "admin"),
+                             "client_id": res.get("client_id")}
+                    self.prefs.sources.append(entry)
+                    self.prefs.save()
+                    src = sources.RemoteSource(entry)
+                    self.sources[entry["id"]] = src
+                    src.start()
+                    dlg.destroy()
+                    self.select_source(entry["id"])
+                    self.set_status(f"Paired with {entry['name']} "
+                                    f"({'read-only' if entry['role'] == 'read' else 'full access'})."
+                                    " Its history is being copied in the background.")
+                ui(ok)
+            threading.Thread(target=work, daemon=True).start()
+
+        conn_b.config(command=connect)
+        pair_b.config(command=pair)
+        fields["host"].focus_set()
+
+    def manage_locations_dialog(self):
+        dlg, frm = self._dialog("Locations", "720x380")
+        ttk.Label(frm, text="Locations", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        box = ttk.Frame(frm, style=self.S["card"], padding=6)
+        box.pack(fill="both", expand=True)
+        cols = ("name", "addr", "access", "state")
+        tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="browse", height=6)
+        for c, h, w in zip(cols, ("Name", "Address", "Access", "Status"), (190, 200, 100, 180)):
+            tree.heading(c, text=h, anchor="w")
+            tree.column(c, width=w, anchor="w")
+        tree.pack(fill="both", expand=True)
+
+        def fill():
+            tree.delete(*tree.get_children())
+            for sid, src in self.sources.items():
+                if src.kind == "local":
+                    tree.insert("", "end", iid=sid, values=(src.name, "this computer", "full", "local"))
+                else:
+                    e = src.entry
+                    tree.insert("", "end", iid=sid, values=(
+                        src.name, f"{e['host']}:{e.get('port')}",
+                        "read-only" if src.role == "read" else "full",
+                        self.location_label(sid).split("—")[-1].strip()))
+        fill()
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="Name").pack(side="left")
+        name_e = ttk.Entry(row, width=28)
+        name_e.pack(side="left", padx=8)
+
+        def sel():
+            s = tree.selection()
+            return s[0] if s else None
+
+        def on_sel(_e=None):
+            sid = sel()
+            name_e.delete(0, "end")
+            if sid:
+                name_e.insert(0, self.sources[sid].name)
+
+        def rename():
+            sid = sel()
+            new = name_e.get().strip()
+            if not sid or not new:
+                return
+            if sid == "local":
+                cfg = core.load_config()
+                cfg["location_name"] = new[:80]
+                core.save_config(cfg)
+            else:
+                self.sources[sid].entry["name"] = new[:80]
+                self.prefs.save()
+            fill()
+            self.update_location_ui()
+
+        def remove():
+            sid = sel()
+            if not sid or sid == "local":
+                return
+            src = self.sources[sid]
+            if not messagebox.askyesno(APP_NAME, f"Remove {src.name} from this viewer?\n\n"
+                                       "Its cached history on this computer is deleted. To also "
+                                       "cut off this viewer's key on the logger, run there:\n"
+                                       "  latency_logger.py remote revoke <id>", parent=dlg):
+                return
+            if self.source.id == sid or self.compare:
+                self.select_source("local")
+            src.stop()
+            src.forget_cache()
+            try:
+                import shutil
+                shutil.rmtree(src.cache, ignore_errors=True)
+            except Exception:
+                pass
+            self.prefs.data["sources"] = [e for e in self.prefs.sources if e["id"] != sid]
+            self.prefs.save()
+            del self.sources[sid]
+            self.sd.pop(sid, None)
+            fill()
+
+        def repair():
+            sid = sel()
+            if not sid or sid == "local":
+                return
+            e = dict(self.sources[sid].entry)
+            dlg.destroy()
+            messagebox.showinfo(APP_NAME, "Pair again with a new code; then remove the old "
+                                "entry here.")
+            self.add_location_dialog(prefill=e)
+
+        tree.bind("<<TreeviewSelect>>", on_sel)
+        ttk.Button(row, text="Rename", command=rename).pack(side="left")
+        ttk.Button(row, text="Re-pair…", command=repair).pack(side="left", padx=6)
+        ttk.Button(row, text="Remove", command=remove).pack(side="left")
+        ttk.Button(row, text="Close", command=dlg.destroy).pack(side="right")
 
     # ---- targets --------------------------------------------------------- #
     def add_target(self):
+        if not self.can_edit:
+            self.set_status("Targets can't be changed here (compare mode or read-only location).")
+            return
         host = self.host_entry.get().strip()
         label = self.label_entry.get().strip()
         if not host:
@@ -574,6 +1050,9 @@ class App:
         self.dirty = True
 
     def remove_target(self):
+        if not self.can_edit:
+            self.set_status("Targets can't be changed here (compare mode or read-only location).")
+            return
         sel = set(self.tree.selection())
         if not sel:
             return
@@ -614,14 +1093,16 @@ class App:
         self.update_status_pill()
 
     def change_log_dir(self):
+        if not self.is_local or self.compare:
+            return
         d = filedialog.askdirectory(initialdir=str(self.logger.log_dir),
                                     title="Choose log folder")
         if d:
-            self.logger.log_dir = Path(d)
-            self.history.clear()
-            self.tail = LogTail(self.logger)
-            self.tail.skip_to_end()
-            self.save_config()
+            self.cfg["log_dir"] = d
+            self.source.save_config({"log_dir": d})
+            self._cfg_ver = self.source.config_version()
+            self.cur.reset()
+            self.cur.load_recent()
             self.dirty = True
             self.set_status(f"The logger will write to {d} from its next round.")
 
@@ -769,6 +1250,8 @@ class App:
     def archive_now(self):
         """gzip finished daily logs now (the logger also does this daily by itself)."""
         import threading
+        if not self.is_local or self.compare:
+            return
         self.archive_btn.state(["disabled"])
         self.set_status("Compressing old daily logs…")
         keep = max(1, int(self.cfg.get("compress_after_days", 1)))
@@ -812,14 +1295,14 @@ class App:
         return self.span_sec
 
     def view_range(self):
-        end = self.view_end or datetime.now()
+        end = self.view_end or self.now()
         return end - timedelta(seconds=self.span_sec), end
 
     def set_view(self, start: datetime, end: datetime):
         """Show an arbitrary span [start, end]. Ending at/after now → live."""
         secs = (end - start).total_seconds()
         self.span_sec = float(round(min(MAX_SPAN, max(MIN_SPAN, secs))))
-        now = datetime.now()
+        now = self.now()
         self.view_end = None if end >= now - timedelta(seconds=2) else end
         self.span_var.set(span_label(self.span_sec))
         self.save_config()
@@ -877,14 +1360,14 @@ class App:
             e_from.delete(0, "end"); e_from.insert(0, f"{a:%Y-%m-%d %H:%M}")  # noqa: E702
             e_to.delete(0, "end"); e_to.insert(0, f"{b:%Y-%m-%d %H:%M}")      # noqa: E702
 
-        today0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        ttk.Button(quick, text="Today", command=lambda: set_fields(today0, datetime.now())).pack(side="left")
+        today0 = self.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        ttk.Button(quick, text="Today", command=lambda: set_fields(today0, self.now())).pack(side="left")
         ttk.Button(quick, text="Yesterday", command=lambda: set_fields(
             today0 - timedelta(days=1), today0)).pack(side="left", padx=4)
         ttk.Button(quick, text="This week", command=lambda: set_fields(
-            today0 - timedelta(days=today0.weekday()), datetime.now())).pack(side="left")
+            today0 - timedelta(days=today0.weekday()), self.now())).pack(side="left")
         ttk.Button(quick, text="This month", command=lambda: set_fields(
-            today0.replace(day=1), datetime.now())).pack(side="left", padx=4)
+            today0.replace(day=1), self.now())).pack(side="left", padx=4)
 
         def apply():
             try:
@@ -934,7 +1417,7 @@ class App:
             start, end = self.view_range()
             mid = start + (end - start) / 2
             half = timedelta(seconds=self.span_sec * 1.5)
-            self.set_view(mid - half, min(mid + half, datetime.now()) if self.view_end is None
+            self.set_view(mid - half, min(mid + half, self.now()) if self.view_end is None
                           else mid + half)
             return
         # Remember where the press happened; the selection only appears once the
@@ -977,122 +1460,76 @@ class App:
         self.set_view(a, b)
 
     # ---- data ------------------------------------------------------------ #
-    def add_point(self, ts, key, latency):
-        dq = self.data.get(key)
-        if dq is None:
-            dq = self.data[key] = deque(maxlen=MAX_POINTS_PER_TARGET)
-        dq.append((ts, latency))
-
     def load_recent(self):
-        """Fill memory with the last 24 h (covers all of today) from the logs."""
-        keys = set(self.keys()) | {GATEWAY_KEY}
-        last_gw, n = None, 0
-        for ts, key, host, lat in self.logger.read_since(datetime.now() - timedelta(days=1), keys):
-            self.add_point(ts, key, lat)
-            if key == GATEWAY_KEY:
-                if last_gw is not None and host != last_gw:
-                    self.gw_events.append((ts, host))
-                last_gw = host
-            n += 1
-        self._gw_last_host = last_gw
-        if n:
-            self.set_status(f"Loaded {n:,} earlier results from the logs.")
+        return self.cur.load_recent()
 
-    @staticmethod
-    def _days(start, end):
-        d = start.date()
-        while d <= end.date():
-            yield d
-            d += timedelta(days=1)
+    def _days(self, start, end):
+        return sources.SourceData._days(start, end)
 
     def raw_series(self, key, start, end):
-        today = date.today()
-        pts = []
-        for d in self._days(start, end):
-            src = self.data.get(key, ()) if d == today else self.history.raw(d).get(key, ())
-            pts.extend(p for p in src if start <= p[0] <= end and p[0].date() == d)
-        return pts
+        return self.cur.raw_series(key, start, end)
 
     def agg_series(self, key, start, end, bucket):
-        """Averaged buckets: [(bucket_start, acc)] sorted by time."""
-        today = date.today()
-        out = {}
-        for d in self._days(start, end):
-            if d == today:
-                for ts, lat in self.data.get(key, ()):
-                    if start <= ts <= end and ts.date() == d:
-                        b = floor_ts(ts, bucket)
-                        acc = out.get(b)
-                        if acc is None:
-                            acc = out[b] = new_acc()
-                        acc_add(acc, lat)
-            else:
-                for m, macc in self.history.minutes(d).get(key, {}).items():
-                    if start <= m <= end:
-                        b = floor_ts(m, bucket)
-                        acc = out.get(b)
-                        if acc is None:
-                            acc = out[b] = new_acc()
-                        acc_merge(acc, macc)
-        return sorted(out.items())
+        return self.cur.agg_series(key, start, end, bucket)
 
     def first_data_ts(self, start, end):
-        """Earliest sample in [start, end] for the current rows, or None."""
-        keys = self.keys()
-        mem = [self.data[k][0][0] for k in keys if self.data.get(k)]
-        earliest = min(mem) if mem else None
-        if earliest is not None and earliest <= start:
+        if self.compare:
             return None
-        # Anything in older log files inside the range? Then there's nothing to trim.
-        stop = earliest.date() if earliest else end.date() + timedelta(days=1)
-        for d in self._days(start, end):
-            if d >= stop or d == date.today():
-                break
-            mins = self.history.minutes(d)
-            firsts = [min(mins[k]) for k in keys if mins.get(k)]
-            if firsts:
-                return max(start, min(firsts))
-        return earliest
+        return self.cur.first_data_ts(self.keys(), start, end)
 
     def gateway_changes(self, start, end):
-        today = date.today()
-        ev = []
-        for d in self._days(start, end):
-            src = self.gw_events if d == today else self.history.gw_events(d)
-            ev.extend(e for e in src if start <= e[0] <= end and e[0].date() == d)
-        return ev
+        return [] if self.compare else self.cur.gateway_changes(start, end)
+
+    def row_series(self, rowkey, start, end, bucket):
+        """Series for one table row: a target (normal) or a location (compare mode)."""
+        if not self.compare:
+            if bucket is None:
+                return "raw", self.cur.raw_series(rowkey, start, end)
+            return "agg", self.cur.agg_series(rowkey, start, end, bucket)
+        sd = self.sdata(rowkey)
+        off = sd.source.offset                       # that location's clock vs ours
+        key = self.compare_key
+        if bucket is None:
+            pts = sd.raw_series(key, start + off, end + off)
+            return "raw", [(ts - off, v) for ts, v in pts]
+        pts = sd.agg_series(key, start + off, end + off, bucket)
+        return "agg", [(b - off, acc) for b, acc in pts]
+
+    def row_last_status(self, rowkey):
+        if self.compare:
+            return self.sdata(rowkey).last_status.get(self.compare_key)
+        return self.cur.last_status.get(rowkey)
 
     # ---- main loop ------------------------------------------------------- #
     def poll(self):
         got = False
-        keys = set(self.keys())
-        for ts, key, host, latency, status, pub in self.tail.read_new():
-            if key == GATEWAY_KEY:
-                if host != self._gw_last_host:
-                    if self._gw_last_host is not None:
-                        self.gw_events.append((ts, host))      # a real network switch
-                        self.set_status(f"Network change — local gateway is now "
-                                        f"{ip_label(host, self.names)}"
-                                        if host else "No local gateway — offline?")
-                    self._gw_last_host = host
-            if pub and pub != self._pub_last:
-                if self._pub_last:
-                    msg = (f"Public IP changed: {ip_label(self._pub_last, self.names)} → "
-                           f"{ip_label(pub, self.names)}")
-                    if pub not in self.names:
+        active = [self.sdata(sid) for sid in self.compare_ids()] if self.compare else [self.cur]
+        for d in active:
+            if d.check_updates():                    # remote sync brought new history
+                self.dirty = True
+            keys = {self.compare_key} if self.compare else set(self.keys())
+            g, events = d.poll(keys)
+            got = got or g
+            if d is not self.cur or self.compare:
+                continue
+            for kind, old, new in events:
+                if kind == "gw":
+                    self.set_status(f"Network change — local gateway is now "
+                                    f"{ip_label(new, self.names)}" if new else
+                                    "No local gateway — offline?")
+                else:
+                    msg = (f"Public IP changed: {ip_label(old, self.names)} → "
+                           f"{ip_label(new, self.names)}")
+                    if new not in self.names:
                         msg += "  —  new network? Name it under Settings › Networks…"
                     self.set_status(msg)
-                self._pub_last = pub
-            if key in keys or key == GATEWAY_KEY:
-                self.add_point(ts, key, latency)
-                self.last_status[key] = status
-                got = True
 
         self._tick += 1
         if self._tick % 4 == 0:                      # every 2 s
             self.refresh_logger_status()
-            self.check_config_changed()
-        if self._tick % 20 == 0 and self.cfg.get("theme") == "system":   # follow OS dark mode
+            if not self.compare:
+                self.check_config_changed()
+        if self._tick % 20 == 0 and self.prefs.get("theme") == "system":   # follow OS dark mode
             t = self.resolve_theme()
             if t != self.theme:
                 self.theme = t
@@ -1111,7 +1548,6 @@ class App:
         self.dirty = False
         self._last_draw = time.monotonic()
         start, end = self.view_range()
-        today = date.today()
         # Live view with less history than the chosen span: start the graph where the
         # data starts, so the left side isn't empty and averaging matches what's shown.
         self._fitted_from = None
@@ -1122,7 +1558,8 @@ class App:
                 start = max(start, first - (end - first) * 0.02)
         bucket = bucket_size_for((end - start).total_seconds())
         prev_status = None
-        if any(d != today and d not in self.history._minutes for d in self._days(start, end)):
+        busy = ([self.sdata(sid) for sid in self.compare_ids()] if self.compare else [self.cur])
+        if any(d.uncached_days(start, end) for d in busy):
             prev_status = self.status_var.get()
             self.set_status("Reading history from log files…")
             try:
@@ -1131,18 +1568,17 @@ class App:
                 pass
         series = {}
         for key, label, shown, color in self.rows():
-            if bucket is None:
-                series[key] = ("raw", self.raw_series(key, start, end))
-            else:
-                series[key] = ("agg", self.agg_series(key, start, end, bucket))
+            series[key] = self.row_series(key, start, end, bucket)
         self.refresh_table(series)
         self.redraw(series, start, end, bucket)
 
         fmt = "%a %d %b %H:%M" if self.span_sec >= 3600 else "%a %d %b %H:%M:%S"
         mode = "● Live" if self.view_end is None else "History"
         res = "every sample" if bucket is None else f"avg per {fmt_bucket(bucket)}"
+        clock = "" if self.compare or self.is_local or abs(
+            self.source.offset.total_seconds()) < 90 else f"  ·  {self.source.name} time"
         self.range_var.set(f"{mode}   {start:{fmt}}  →  {end:{fmt}}   ·   "
-                           f"{span_label(self.span_sec)}, {res}")
+                           f"{span_label(self.span_sec)}, {res}{clock}")
         try:
             self.live_btn.state(["disabled"] if self.view_end is None else ["!disabled"])
         except Exception:
@@ -1184,8 +1620,9 @@ class App:
             s, ok, lost, mn, mx = total
             n = ok + lost
             last_txt = fmt(last)
-            if live and last is None and key in self.last_status:
-                last_txt = self.last_status[key]          # e.g. "timeout", "no network"
+            st_txt = self.row_last_status(key)
+            if live and last is None and st_txt:
+                last_txt = st_txt                          # e.g. "timeout", "no network"
             values = (shown, last_txt, fmt(s / ok if ok else None),
                       fmt(mn if ok else None), fmt(mx if ok else None),
                       f"{100 * lost / n:.1f}%" if n else "–")
@@ -1319,6 +1756,8 @@ class App:
 
     def on_close(self):
         self.apply_settings()
+        for src in self.sources.values():
+            src.stop()
         self.root.destroy()
 
 

@@ -7,7 +7,7 @@ Latency monitoring for macOS, Windows and Linux, split into two programs:
 | **Logger** (`latency_logger.py`) | Headless. Pings your targets and the current local gateway, looks up the public IP, and appends everything to daily CSV logs. Can run as a service that starts at boot. | Python 3.9+ only, no extra packages |
 | **Viewer** (`latency_viewer.py`) | The window: live and historical graphs, stats, targets and settings. It doesn't ping anything; it reads the logs and follows today's file live. | Python + Tkinter + matplotlib |
 
-Both share `~/LatencyChecker/`:
+On one machine both share `~/LatencyChecker/`. They can also run on different machines; see *Several locations* below.
 
 - `config.json` holds the targets and settings. The viewer edits it, and the logger re-reads it within one round.
 - `logs/latency_YYYY-MM-DD.csv` holds the measurements.
@@ -107,6 +107,44 @@ With **Record public IP** switched on (Settings), every log row also stores your
 
 - Logs: `~/LatencyChecker/logs/latency_YYYY-MM-DD.csv` (one per day). Columns: `timestamp, host, label, latency_ms, status, role, public_ip` (`role` is `gateway` or `target`). Today's file from an older version gets the new header automatically, and your rows are kept. Change the folder with **Change log folder…**.
 - Settings, targets, span and theme: `~/LatencyChecker/config.json` (shared by the logger and the viewer). Set `"theme"` to `"system"`, `"dark"` or `"light"`.
+
+## Several locations (remote loggers)
+
+Run a logger at each place you want to measure from, e.g. the Lisbon house and the Andorra home. One viewer can then show any of them, or compare them side by side.
+
+**On each remote logger machine (once):**
+
+```
+python3 latency_logger.py remote enable --name "Andorra Home"      # add --bind <address> to limit it
+python3 latency_logger.py pair                                     # prints address, one-time code, fingerprint
+```
+
+**In the viewer:** open **Location › Add location…**, enter the address and the code, and press **Connect**. Check that the fingerprint matches the one `pair` printed, then press **Fingerprint matches — Pair**.
+
+- **Location picker** (header): choose *This computer* or any paired location. Each entry shows whether it's online, offline or its logger is stopped. Targets, settings, network names, stats and graphs all follow the selected location. Changes you make are sent to that logger, unless the location was paired with `pair --read-only`.
+- **Compare locations:** pick one target, e.g. Cloudflare DNS or the local gateway, to get one line per location on a single time axis. It shows whether a slowdown is local or everywhere.
+- **Offline:** each location's history is copied into `~/LatencyChecker/remote-cache/`. Finished days are copied once and today's file is followed incrementally, so you can still browse a location while it's unreachable.
+- **Time zones:** a location's graphs use that location's local time, and the range line says so. Compare mode puts everything on this computer's clock.
+- **Manage locations…:** rename, re-pair or remove a location. Removing deletes its cache; also run `latency_logger.py remote revoke <id>` on the logger.
+
+**Security:**
+
+- TLS 1.2+ on every connection. The logger's self-signed certificate is pinned by fingerprint on first contact, like SSH, so an impostor is refused.
+- Each viewer has its own random 256-bit key, obtained through a single-use pairing code that expires after 10 minutes. The logger stores only a hash of each key.
+- Roles: *full access* or *read-only*.
+- Failed logins and pairing attempts are rate-limited per address, and pairings, config changes and rejected requests appear in `logger.log`.
+- A remote viewer can't change where logs are stored, and every target it sends is validated.
+- The viewer keeps its keys in `~/LatencyChecker/viewer.json`, readable only by you.
+- Across the internet, use a VPN such as Tailscale or WireGuard and `--bind` to its address, rather than opening a port on your router.
+
+**Logger commands:**
+
+- `remote status`: shows whether it's listening, the addresses, the fingerprint and how many viewers are paired.
+- `remote clients`: lists the paired viewers.
+- `remote revoke <id|name>`: removes one viewer.
+- `remote disable`: stops remote access.
+
+Creating the certificate uses `openssl`, which is built into macOS and Linux, or the `cryptography` package (`pip install cryptography`, the easiest route on Windows).
 
 ## Log compression
 

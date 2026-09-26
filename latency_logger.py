@@ -15,6 +15,12 @@ packages: standard-library Python 3.9+ only.
     python3 latency_logger.py archive         compress finished daily logs now (safe while running)
     python3 latency_logger.py restart         restart the installed service
 
+Remote viewers (viewer on another machine, over TLS with per-viewer keys):
+    python3 latency_logger.py remote enable [--port 8765] [--bind 0.0.0.0] [--name "Lisbon House"]
+    python3 latency_logger.py pair [--read-only]      one-time code to connect a viewer
+    python3 latency_logger.py remote status|clients|disable
+    python3 latency_logger.py remote revoke <id or name>
+
 Finished daily logs are gzip-compressed automatically (at start-up and after each
 midnight) to latency_YYYY-MM-DD.csv.gz; the viewer reads them transparently.
 
@@ -98,6 +104,9 @@ class LatencyLogger:
         self.started = datetime.now()
         self._archived_on = None
         self._archiving = False
+        self.remote = None                       # latency_remote.RemoteServer when enabled
+        self._remote_state = (False, None, None)
+        self.remote_error = None
         self.reload_config()
         self.pubwatch = core.PublicIPWatcher(self)
 
@@ -129,6 +138,30 @@ class LatencyLogger:
                  "loaded" if first else "reloaded", len(self.targets), self.interval_sec,
                  self.timeout_ms, "on" if self.gateway_enabled else "off",
                  "on" if self.public_ip_enabled else "off", log_dir)
+        rc = cfg.get("remote") or {}
+        self.apply_remote((bool(rc.get("enabled")), rc.get("bind") or "0.0.0.0",
+                           int(rc.get("port") or 8765)))
+
+    def apply_remote(self, wanted):
+        """Start/stop/move the HTTPS API when the remote settings change."""
+        if wanted == self._remote_state:
+            return
+        self._remote_state = wanted
+        enabled, bind, port = wanted
+        if self.remote:
+            self.remote.stop()
+            self.remote = None
+        self.remote_error = None
+        if not enabled:
+            return
+        try:
+            import latency_remote
+            self.remote = latency_remote.RemoteServer(lambda: self.csv.log_dir, log)
+            self.remote.start(bind, port)
+        except Exception as exc:
+            self.remote = None
+            self.remote_error = str(exc)
+            log.error("remote access could not start on %s:%s: %s", bind, port, exc)
 
     # ---- one round ------------------------------------------------------- #
     def round(self):
@@ -205,6 +238,9 @@ class LatencyLogger:
             "gateway_enabled": self.gateway_enabled, "gateway": self.gateway,
             "public_ip_enabled": self.public_ip_enabled, "public_ip": self.public_ip,
             "log_dir": str(self.csv.log_dir), "last": self.last,
+            "remote": {"enabled": self._remote_state[0], "bind": self._remote_state[1],
+                       "port": self._remote_state[2], "listening": bool(self.remote),
+                       "error": self.remote_error},
         }
 
     # ---- main loop ------------------------------------------------------- #
@@ -223,6 +259,8 @@ class LatencyLogger:
                 log.exception("round failed")
             self.stop_event.wait(max(0.2, self.interval_sec - (time.monotonic() - started)))
         core.write_status(self.status(running=False))
+        if self.remote:
+            self.remote.stop()
         self.pool.shutdown(wait=False)
         log.info("logger stopped")
 
@@ -320,7 +358,7 @@ def _deploy(data_dir: Path):
         if Path(sys.executable).resolve() != dst.resolve():
             shutil.copy2(sys.executable, dst)
         return [str(dst)]
-    for name in ("latency_core.py", "latency_logger.py"):
+    for name in ("latency_core.py", "latency_logger.py", "latency_remote.py"):
         shutil.copy2(HERE / name, app_dir / name)
     return [_base_python(windowless=True), str(app_dir / "latency_logger.py")]
 
@@ -685,10 +723,123 @@ def cmd_restart(args):
     return r.returncode
 
 
+def _remote_mod():
+    import latency_remote
+    return latency_remote
+
+
+def _warn_if_root():
+    if os.name != "nt" and os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        print("Note: run remote/pair commands WITHOUT sudo, so the keys belong to your user.")
+
+
+def _print_connect_hint(R, cfg):
+    rc = cfg.get("remote") or {}
+    port = int(rc.get("port") or R.DEFAULT_PORT)
+    bind = rc.get("bind") or "0.0.0.0"
+    addrs = R.local_addresses() if bind in ("0.0.0.0", "::") else [bind]
+    print(f"  location name: {R.location_name(cfg)}")
+    print("  connect to:    " + (", ".join(f"{a}:{port}" for a in addrs) or f"<this machine>:{port}"))
+    try:
+        cert, _ = R.ensure_certificate()
+        print(f"  fingerprint:   {R.fingerprint_pem(cert)}")
+    except Exception as exc:
+        print(f"  certificate:   not available ({exc})")
+
+
+def cmd_remote(args):
+    R = _remote_mod()
+    _warn_if_root()
+    sub = (args.args or ["status"])[0]
+    cfg = core.load_config()
+    rc = dict(cfg.get("remote") or {})
+    if sub == "enable":
+        rc.update({"enabled": True,
+                   "bind": args.bind or rc.get("bind") or "0.0.0.0",
+                   "port": int(args.port or rc.get("port") or R.DEFAULT_PORT)})
+        cfg["remote"] = rc
+        if args.name:
+            cfg["location_name"] = args.name[:80]
+        try:
+            R.ensure_certificate()
+        except Exception as exc:
+            print(exc)
+            return 1
+        core.save_config(cfg)
+        print("Remote access enabled. The running logger starts listening within one round.")
+        _print_connect_hint(R, cfg)
+        print("\nNext: run  latency_logger.py pair  and enter the code in the viewer "
+              "(Location › Add location…).\nYour firewall may ask to allow incoming connections "
+              "for Python/LatencyLogger — allow it on private networks only.\n"
+              "Across the internet, prefer a VPN such as Tailscale/WireGuard (use --bind with "
+              "its address) over opening a port on your router.")
+        return 0
+    if sub == "disable":
+        rc["enabled"] = False
+        cfg["remote"] = rc
+        core.save_config(cfg)
+        print("Remote access disabled (the logger stops listening within one round). "
+              "Paired viewers keep their keys; use  remote revoke  to remove them.")
+        return 0
+    if sub == "clients":
+        cl = R.ClientStore().list()
+        if not cl:
+            print("No viewers are paired.")
+        for cid, c in cl.items():
+            print(f"  {cid}  {c.get('name', ''):<28} {c.get('role', ''):<6} paired {c.get('created')}"
+                  f"  last seen {c.get('last_seen') or 'never'}")
+        return 0
+    if sub == "revoke":
+        if len(args.args) < 2:
+            print("Usage: latency_logger.py remote revoke <id or name>")
+            return 1
+        gone = R.ClientStore().revoke(args.args[1])
+        print(f"Revoked {', '.join(gone)}." if gone else "No viewer with that id or name.")
+        return 0 if gone else 1
+    if sub == "status":
+        st = core.read_status() or {}
+        live = (st.get("remote") or {}) if core.logger_alive(st) else {}
+        print(f"Remote access: {'enabled' if rc.get('enabled') else 'disabled'} in config; "
+              + ("logger is LISTENING" if live.get("listening") else
+                 f"logger not listening{(' — ' + live['error']) if live.get('error') else ''}"
+                 if core.logger_alive(st) else "logger is not running"))
+        _print_connect_hint(R, cfg)
+        n = len(R.ClientStore().list())
+        print(f"  paired viewers: {n}  (see: remote clients)")
+        return 0
+    print("Usage: latency_logger.py remote enable|disable|status|clients|revoke")
+    return 1
+
+
+def cmd_pair(args):
+    R = _remote_mod()
+    _warn_if_root()
+    cfg = core.load_config()
+    if not (cfg.get("remote") or {}).get("enabled"):
+        print("Remote access is off. Turn it on first:  latency_logger.py remote enable")
+        return 1
+    st = core.read_status()
+    if not core.logger_alive(st):
+        print("Warning: the logger isn't running, so the viewer can't connect yet.")
+    code = R.create_pairing_code("read" if args.read_only else "admin")
+    print(f"Pairing code:  {code}   (valid 10 minutes, single use, "
+          f"{'read-only' if args.read_only else 'can change settings'})")
+    _print_connect_hint(R, cfg)
+    print("\nIn the viewer: Location › Add location…, enter the address and this code, and check "
+          "that the fingerprint it shows matches the one above.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Latency Checker headless logger")
     ap.add_argument("command", nargs="?", default="run",
-                    choices=["run", "install", "uninstall", "status", "archive", "restart"])
+                    choices=["run", "install", "uninstall", "status", "archive", "restart",
+                             "remote", "pair"])
+    ap.add_argument("args", nargs="*", help="for 'remote': enable|disable|status|clients|revoke <id>")
+    ap.add_argument("--port", type=int, help="remote enable: port (default 8765)")
+    ap.add_argument("--bind", help="remote enable: address to listen on (default all)")
+    ap.add_argument("--name", help="remote enable: this location's name, e.g. 'Lisbon House'")
+    ap.add_argument("--read-only", action="store_true", help="pair: viewer may not change settings")
     ap.add_argument("--home", help="data folder (default ~/LatencyChecker)")
     ap.add_argument("--quiet", action="store_true", help="no console output (used by the service)")
     ap.add_argument("--at-login", action="store_true",
@@ -698,7 +849,7 @@ def main(argv=None):
         core.set_home(args.home)
     return {"run": cmd_run, "install": cmd_install, "uninstall": cmd_uninstall,
             "status": cmd_status, "archive": cmd_archive,
-            "restart": cmd_restart}[args.command](args)
+            "restart": cmd_restart, "remote": cmd_remote, "pair": cmd_pair}[args.command](args)
 
 
 if __name__ == "__main__":

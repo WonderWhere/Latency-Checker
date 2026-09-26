@@ -14,19 +14,19 @@ jobs:
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --noconfirm --windowed --collect-data sv_ttk --name "Latency Checker" latency_viewer.py
-          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+          pyinstaller --noconfirm --windowed --collect-data sv_ttk --hidden-import latency_remote --hidden-import latency_sources --name "Latency Checker" latency_viewer.py
+          pyinstaller --noconfirm --onefile --hidden-import latency_remote --name LatencyLogger latency_logger.py
           cd dist && ditto -c -k --keepParent "Latency Checker.app" LatencyChecker-macOS.zip
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: |
           pyinstaller --noconfirm --windowed --onefile --collect-data sv_ttk --name LatencyChecker latency_viewer.py
-          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+          pyinstaller --noconfirm --onefile --hidden-import latency_remote --name LatencyLogger latency_logger.py
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --noconfirm --onefile --collect-data sv_ttk --name latency-checker latency_viewer.py
-          pyinstaller --noconfirm --onefile --name LatencyLogger latency_logger.py
+          pyinstaller --noconfirm --onefile --collect-data sv_ttk --hidden-import latency_remote --hidden-import latency_sources --name latency-checker latency_viewer.py
+          pyinstaller --noconfirm --onefile --hidden-import latency_remote --name LatencyLogger latency_logger.py
       - uses: actions/upload-artifact@v4
         with:
           name: LatencyChecker-${{ runner.os }}

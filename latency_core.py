@@ -28,7 +28,7 @@ from pathlib import Path
 
 APP_NAME = "Latency Checker"
 SYSTEM = platform.system()  # "Darwin", "Windows", "Linux"
-VERSION = "4.1"
+VERSION = "5.0"
 
 # Data folder (config, status, logs). Override with LATENCYCHECKER_HOME or set_home().
 APP_DIR = Path(os.environ.get("LATENCYCHECKER_HOME") or (Path.home() / "LatencyChecker"))
@@ -611,13 +611,14 @@ class LogTail:
     Switches to the new file automatically after midnight.
     """
 
-    def __init__(self, logger: CsvLogger):
+    def __init__(self, logger: CsvLogger, now_fn=datetime.now):
         self.logger = logger
+        self.now_fn = now_fn          # the logger's clock (remote locations may differ)
         self.path = None
         self.offset = 0
 
     def skip_to_end(self):
-        self.path = self.logger.path_for(datetime.now())
+        self.path = self.logger.path_for(self.now_fn())
         try:
             self.offset = self.path.stat().st_size
         except OSError:
@@ -625,7 +626,7 @@ class LogTail:
 
     def read_new(self):
         rows = []
-        path = self.logger.path_for(datetime.now())
+        path = self.logger.path_for(self.now_fn())
         if path != self.path:
             if self.path is not None:            # finish yesterday's file first
                 rows += self._read(self.path)
