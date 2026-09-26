@@ -9,3 +9,6 @@
 *.bat       text eol=crlf
 *.vbs       text eol=crlf
 **/Contents/MacOS/launcher  text eol=lf
+*.png  binary
+*.icns binary
+*.ico  binary

@@ -10,7 +10,7 @@ Name=Latency Checker
 Comment=Latency graphs for your targets, gateway and public IP
 Exec="$DIR/run_linux.sh"
 Path=$DIR
-Icon=network-wired
+Icon=$DIR/assets/icon.png
 Terminal=false
 Categories=Network;Monitor;Utility;
 DESK

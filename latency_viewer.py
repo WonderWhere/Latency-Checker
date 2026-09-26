@@ -126,6 +126,11 @@ class App:
         self._tick = 0
 
         root.title(APP_NAME)
+        try:                                   # window/Dock/taskbar icon
+            self._icon = tk.PhotoImage(master=root, file=str(HERE / "assets" / "icon-256.png"))
+            root.iconphoto(True, self._icon)
+        except Exception:
+            pass
         root.geometry("1320x800")
         root.minsize(1040, 600)
         self.theme = self.resolve_theme()
