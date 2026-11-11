@@ -325,16 +325,68 @@ class App:
         self.update_status_pill()
         self.dirty = True
 
-    def dot(self, color):
-        """Small round colour swatch for the table."""
-        if color not in self._dots:
+    def dot(self, color, hollow=False):
+        """Small round colour swatch for the table (a ring when the host is hidden)."""
+        if (color, hollow) not in self._dots:
             img = tk.PhotoImage(master=self.root, width=12, height=12)
             for y in range(12):
                 for x in range(12):
-                    if (x - 5.5) ** 2 + (y - 5.5) ** 2 <= 20:
+                    d = (x - 5.5) ** 2 + (y - 5.5) ** 2
+                    if d <= 20 and (not hollow or d >= 9):
                         img.put(color, to=(x, y))
-            self._dots[color] = img
-        return self._dots[color]
+            self._dots[(color, hollow)] = img
+        return self._dots[(color, hollow)]
+
+    # ---- which hosts are drawn on the graph ------------------------------ #
+    def _hidden_scope(self):
+        """Hidden hosts are remembered per location (and per compared target)."""
+        return f"compare:{self.compare_key}" if self.compare else self.source.id
+
+    def hidden_keys(self):
+        return set((self.prefs.get("hidden") or {}).get(self._hidden_scope(), ()))
+
+    def set_hidden(self, keys):
+        allh = dict(self.prefs.get("hidden") or {})
+        if keys:
+            allh[self._hidden_scope()] = sorted(keys)
+        else:
+            allh.pop(self._hidden_scope(), None)
+        self.prefs.set(hidden=allh)
+        self.dirty = True
+
+    def toggle_hidden(self, key):
+        self.set_hidden(self.hidden_keys() ^ {key})
+
+    def show_only(self, key):
+        self.set_hidden({k for k in self.keys_for_graph() if k != key})
+
+    def keys_for_graph(self):
+        """Row keys as drawn on the graph (in compare mode: one per location)."""
+        return [r[0] for r in self.rows()]
+
+    def on_tree_click(self, ev):
+        """A click on a host's colour dot shows/hides it on the graph."""
+        row = self.tree.identify_row(ev.y)
+        if not row or self.tree.identify_column(ev.x) != "#0" or ev.x > 30:
+            return None
+        self.toggle_hidden(row)
+        self.render()
+        return "break"                      # don't also change the selection
+
+    def on_tree_menu(self, ev):
+        row = self.tree.identify_row(ev.y)
+        if not row:
+            return
+        hidden = row in self.hidden_keys()
+        m = tk.Menu(self.root, tearoff=False)
+        m.add_command(label="Show on graph" if hidden else "Hide from graph",
+                      command=lambda: (self.toggle_hidden(row), self.render()))
+        m.add_command(label="Show only this", command=lambda: (self.show_only(row), self.render()))
+        m.add_command(label="Show all", command=lambda: (self.set_hidden(set()), self.render()))
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
 
     # ---- UI -------------------------------------------------------------- #
     def build_ui(self):
@@ -429,8 +481,14 @@ class App:
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self.networks_dialog()
                        if self.tree.identify_row(e.y) == GATEWAY_KEY else None)
-        ttk.Label(side, text="Latency in ms · stats cover the range on the graph",
-                  style="Muted.TLabel").pack(anchor="w", pady=(4, 10))
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        for seq in (("<Button-2>", "<Control-Button-1>") if SYSTEM == "Darwin"
+                    else ("<Button-3>",)):
+            self.tree.bind(seq, self.on_tree_menu)
+        ttk.Label(side, text="Latency in ms · stats cover the range on the graph · "
+                             "click a dot to show/hide it on the graph",
+                  style="Muted.TLabel", wraplength=480, justify="left").pack(
+            anchor="w", pady=(4, 10))
 
         add = ttk.Frame(side)
         add.pack(fill="x")
@@ -1609,6 +1667,8 @@ class App:
             self.tree.delete(iid)
         fmt = lambda v: "–" if v is None else f"{v:.1f}"  # noqa: E731
         live = self.view_end is None
+        hidden = self.hidden_keys()
+        self.tree.tag_configure("hidden", foreground=self.pt["muted"])
         for i, (key, label, shown, color) in enumerate(rows):
             kind, pts = series.get(key, ("raw", []))
             total = new_acc()
@@ -1631,11 +1691,13 @@ class App:
             values = (shown, last_txt, fmt(s / ok if ok else None),
                       fmt(mn if ok else None), fmt(mx if ok else None),
                       f"{100 * lost / n:.1f}%" if n else "–")
+            off = key in hidden
+            item = dict(text=f"  {label}", image=self.dot(color, hollow=off), values=values,
+                        tags=("hidden",) if off else ())
             if key in existing:
-                self.tree.item(key, text=f"  {label}", image=self.dot(color), values=values)
+                self.tree.item(key, **item)
             else:
-                self.tree.insert("", "end", iid=key, text=f"  {label}", image=self.dot(color),
-                                 values=values)
+                self.tree.insert("", "end", iid=key, **item)
             self.tree.move(key, "", i)
 
     @staticmethod
@@ -1666,9 +1728,14 @@ class App:
             ax.set_yscale("log")
         any_data = False
         line_vals, spikes = [], []          # plotted values → y-axis scaling
+        hidden = self.hidden_keys()
+        skipped = False                     # hosts with data that the user has hidden
         for key, label, shown, color in self.rows():
             kind, pts = series.get(key, ("raw", []))
             if not pts:
+                continue
+            if key in hidden:
+                skipped = True
                 continue
             any_data = True
             lw = 2.0 if key == GATEWAY_KEY else 1.6
@@ -1755,7 +1822,9 @@ class App:
             for txt in leg.get_texts():
                 txt.set_color(pt["fg"])
         else:
-            ax.text(0.5, 0.5, "No data in this time range", transform=ax.transAxes,
+            msg = ("All hosts are hidden — click a dot in the Targets table to show one"
+                   if skipped else "No data in this time range")
+            ax.text(0.5, 0.5, msg, transform=ax.transAxes,
                     ha="center", va="center", color=pt["muted"], fontsize=11)
         self.canvas.draw_idle()
 
